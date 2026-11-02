@@ -1199,6 +1199,10 @@ use_engine_pins(void)
 	gpio_configure(PIN_CS, PIN_FUNCTION_QUP, PULL_DOWN, 2, false);
 }
 
+/* How far bring_up got: the standing-by line says it, because the print that told us scrolled
+ * away long before anyone could read it (a real machine starts this in under a second). */
+static unsigned reached;
+
 /* -1: something failed; 0: asked to stop at a stage, nothing to complain about; 1: ready. */
 static int
 bring_up(void)
@@ -1210,6 +1214,7 @@ bring_up(void)
 		printf("himax: the CX domain is not asked for; the chip is left alone\n");
 		return -1;
 	}
+	reached = STAGE_CX;
 	if (stop_after == STAGE_CX) {
 		printf("himax: himax_stop=%u: stopping after stage 1\n", stop_after);
 		return 0;
@@ -1227,6 +1232,7 @@ bring_up(void)
 		return -1;
 	}
 	spi_transfer = geni_transfer;
+	reached = STAGE_CLOCKS;
 	if (stop_after == STAGE_CLOCKS) {
 		printf("himax: himax_stop=%u: stopping after stage 2\n", stop_after);
 		return 0;
@@ -1237,6 +1243,7 @@ bring_up(void)
 	gpio_configure(PIN_INT, 0, PULL_NONE, 2, false);   /* the device tree leaves this one unbiased */
 	use_engine_pins();
 	show_state("pins set");
+	reached = STAGE_PINS;
 	if (stop_after == STAGE_PINS) {
 		printf("himax: himax_stop=%u: stopping after stage 3\n", stop_after);
 		return 0;
@@ -1248,6 +1255,7 @@ bring_up(void)
 	if (!himax_probe()) {
 		return -1;
 	}
+	reached = STAGE_CHIP;
 	if (stop_after == STAGE_CHIP) {
 		printf("himax: himax_stop=%u: stopping after stage 4\n", stop_after);
 		return 0;
@@ -1278,10 +1286,27 @@ himax_thread(__unused void *parameter, __unused wait_result_t result)
 	rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
 	cmd_db = ml_io_map_wcomb(CMD_DB_PHYS, CMD_DB_SIZE);      /* memory, not registers: no alignment rules */
 
-	if (bring_up() != 1) {
+	int up = bring_up();
+	if (up < 0) {
 		if (stop_after >= STAGE_REPORTS) {
 			printf("himax: no himax touch screen\n");
 		}
+		/* Standing by is the point: on this machine the screen is the instrument, the
+		 * boot prints scroll away in under a second, and a reader with a photo of the
+		 * desktop cannot reach what went past. Every half minute, say where things
+		 * stopped and what the lines read now; touch nothing else. */
+		for (;;) {
+			sleep_us(30 * 1000 * 1000);
+			printf("himax: standing by: it got as far as stage %u of 5; the interrupt line is %s, "
+			    "the reset line is %s; the engine's clock branch reads %#x, the votes %#x\n",
+			    reached > STAGE_REPORTS ? STAGE_REPORTS : reached,
+			    gpio_get(PIN_INT) ? "high" : "low",
+			    gpio_get(PIN_RESET) ? "released (high, as it should be)" : "held low (the chip is in reset)",
+			    rd(GCC_QUP0_SE6_CBCR), rd(GCC_VOTE));
+		}
+	}
+	if (up == 0) {
+		/* a deliberate himax_stop: the probe asked to stop at a stage; nothing to complain about */
 		thread_terminate(current_thread());
 		return;
 	}
@@ -1295,7 +1320,7 @@ himax_thread(__unused void *parameter, __unused wait_result_t result)
 			idle = 0;
 			himax_poll();
 		}
-		if (tick % (60 * (1000000 / poll_us)) == 0) {
+		if (tick % (30 * (1000000 / poll_us)) == 0) {
 			printf("himax: so far %u frames in %u looks (%u bad), %u finger positions, the last at %u, %u; "
 			    "interrupt line %s; the line looked at every %u us\n",
 			    seen.reports, seen.polls, seen.bad, seen.touches, seen.last_x, seen.last_y,
