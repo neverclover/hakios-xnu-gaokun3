@@ -14,6 +14,11 @@ driver GOODIX
 	help    the touch screen: a Goodix GT9916 ("Berlin-D") or a FocalTech FT3680 on SPI (touchscreen=1). The bus,
 	help    pins and supplies are the POCO X5 Pro's; another phone with one of these controllers changes those
 
+driver HIMAX
+	file    bsd/dev/hakios.himax.c
+	help    the touch screen of the Huawei MateBook E Go (gaokun3): a Himax HX83121a on the QUPv3 SPI6 serial
+	help    engine, reset and interrupt as that laptop's own device tree lists them (touchscreen=1)
+
 driver BUTTONS
 	file    bsd/dev/hakios.buttons.c
 	help    the power and volume keys, read from the PMIC through the SPMI arbiter (buttons=1)
