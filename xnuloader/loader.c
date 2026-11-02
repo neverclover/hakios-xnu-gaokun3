@@ -561,6 +561,12 @@ struct platform {
 	int core_shift;                  /* ... in this bit of MPIDR: the phone numbers them in the second affinity field */
 	uint32_t timeout_scale;          /* a kernel on several cores gets this much longer to wait for a lock, 0: as it is */
 	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
+	/*
+	 * A panel the machine's own device tree describes, for firmware that does not show us a GOP:
+	 * base + geometry in 32-bit pixels (a8r8g8b8, what boot_args.v_depth 32 means). 0: none known.
+	 */
+	uint64_t fb_base;
+	uint32_t fb_width, fb_height, fb_stride;
 };
 
 static const struct platform platform_qemu_virt = {
@@ -586,6 +592,33 @@ static const struct platform platform_redwood = {
 	 * (XNU's machine_routines.c, ml_choose_slow_core_partners()).
 	 */
 	.small_cores = 0x0f,
+};
+
+/*
+ * The Huawei MateBook E Go 2023 (gaokun3): a laptop UEFI on the Qualcomm SC8280XP
+ * (Snapdragon 8cx Gen 3). The GIC is at the same addresses as the SC7280's, with the
+ * same MPIDR numbering, but the split by number is the other way round from the phone's:
+ * cores 0-3 are the Cortex-X1c cluster, 4-7 the Cortex-A78c one (read from the running
+ * core's MIDR and from what the kernel's scheduler said on the screen). There is no serial console on this
+ * machine (its Android port's README says so plainly: no fastboot, no Android
+ * bootloader, no serial - just UEFI), so the log is the framebuffer and the log
+ * partition, as on the phone. The firmware speaks PSCI with SMC (the device tree's
+ * psci node: method = "smc"). The display is the UEFI GOP framebuffer, which the
+ * device tree's own simple-framebuffer node puts at 0xC6200000 - the address by
+ * which this loader recognizes the machine, as it recognizes the phone by its own.
+ */
+static const struct platform platform_gaokun3 = {
+	/* io_base must be non-zero: XNU treats a zero SoC base as "no SoC" and skips clock setup. */
+	.name = "gaokun3", .io_base = 0x00400000, .io_size = 0x3FC00000,
+	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 1,
+	.cores = 8, .core_shift = 8,
+	/* The machine's own screen said it plainly (verbose boot): the kernel marked the cores it
+	 * numbered by MPIDR 0x000-0x300 as the slower ones with the old 0x0f - wrong way round.
+	 * UEFI itself ran on number 7, which read MIDR part 0xfd4b (a Cortex-A78c): the A78c are
+	 * numbers 4-7, the Cortex-X1c 0-3. The little ones get the bits. */
+	.small_cores = 0xf0,
+	/* the panel Huawei's own firmware device tree describes (simple-framebuffer@c6200000). */
+	.fb_base = 0xC6200000ULL, .fb_width = 1600, .fb_height = 2560, .fb_stride = 6400,
 };
 
 /* ------------------------------------------------------------------------ */
@@ -971,7 +1004,11 @@ static uint64_t sound_len;
 #define OTHER_CPU_HUNG          1001    /* ... the kernel stopped giving signs of life */
 #define START_SECONDS           5
 #define SILENCE_SECONDS         50
-#define NOTE_SECONDS            24      /* how long the kernel's progress is written down as it happens */
+#define NOTE_SECONDS            240     /* how long the kernel's progress is written down as it happens */
+#define NOTE_LIVE_SECONDS       60      /* every two seconds up to here; a new machine's boot is all of it.
+                                         * After that a driver that keeps talking says so on a slower beat:
+                                         * a standing-by line every half minute lands in the next snapshot.
+                                         * The whole window has to fit the log buffer: 30 x 2 s + 18 x 10 s. */
 
 static void wdt_pet(void);
 static int wdt_armed;
@@ -2273,7 +2310,7 @@ note_kernel_progress(const struct kernel_live *live, uint64_t slide, uint64_t se
 	if (len > live->log_head + live->log_ring) {
 		len = 0;
 	}
-	from = len > 240 ? len - 240 : 0;
+	from = len > 512 ? len - 512 : 0;   /* a driver's standing-by line is meant to fit whole */
 	flush_dcache((uint64_t)(uintptr_t)log + from, (uint64_t)(uintptr_t)log + len);
 	print("%d s: the kernel has logged %d bytes, heartbeat %d; the last of it:\n", seconds, (uint64_t)len, live->heartbeat);
 	for (uint32_t i = from; i < len; i++) {
@@ -2350,9 +2387,13 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 		 * The first seconds are the ones in which a new arrangement goes wrong, and a machine
 		 * that resets takes this loader's memory with it: where there is storage for the log,
 		 * what the kernel is seen to do goes there as it happens. That needs UEFI's services,
-		 * so until NOTE_SECONDS are over this core keeps its interrupts.
+		 * so until NOTE_SECONDS are over this core keeps its interrupts. The window reaches
+		 * into the running system on purpose: a driver that stands by and says where it stands
+		 * is worth reading, and a machine whose boot is done answers the same way whether it is
+		 * asked at 24 seconds or at four minutes. (A MateBook E Go said nothing at all until
+		 * this window was longer than its own boot: see 6l+ of the porting notes.)
 		 */
-		if (!watching_only && seconds_since(started) >= noted + 2) {
+		if (!watching_only && seconds_since(started) >= noted + (noted >= NOTE_LIVE_SECONDS ? 10 : 2)) {
 			noted = seconds_since(started);
 			if (PLAT->log_other_cpu) {
 				if (!arrived) {
@@ -2709,6 +2750,7 @@ static struct {
 } SCREEN;
 static uint64_t win_base, win_size; /* XNU's physical memory window, claimed once */
 static uint64_t resident_rd_size;   /* root image kept at win_base + RESIDENT_RD_OFFSET, 0 if none */
+static uint64_t read_volume_file(const char16 *path, uint64_t dst, uint64_t max_size);
 static char last_result[64] = "idle";
 
 static void
@@ -2940,6 +2982,30 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		memcpy((void *)(phys_base + RESIDENT_RD_OFFSET), pi.resident, pi.resident_size);
 		resident_rd_size = pi.resident_size;
 		print("resident image from the payload: %x bytes\n", (uint64_t)pi.resident_size);
+	}
+	/*
+	 * A system image on the volume: the UEFI-native way to bring the whole of Darwin
+	 * (docs/uefi-boot.md: the big image does not fit the 63 MiB payload, and nothing else
+	 * carried it). \EFI\hakios\system.apfs sits next to payload.bin on the same ESP, and
+	 * this reads it straight to the resident address - the same address `xl ramdisk' fills
+	 * on the phone and run-darwin.sh preloads for QEMU. A machine that boots from its own
+	 * disk has room for 2.5 GB that the payload region does not; the room test is the one
+	 * the payload's own resident image is held to, above.
+	 */
+	if (resident_rd_size == 0 && pi.resident == NULL && pi.resident_rd == 0) {
+		static const char16 sys_path[] = u"\\EFI\\hakios\\system.apfs";
+
+		if (win_size <= RESIDENT_RD_OFFSET + RESIDENT_RD_RESERVE) {
+			print("no room above the resident address for a system image on the volume\n");
+		} else {
+			uint64_t room = win_size - RESIDENT_RD_OFFSET - RESIDENT_RD_RESERVE;
+			uint64_t got = read_volume_file(sys_path, phys_base + RESIDENT_RD_OFFSET, room);
+
+			if (got != 0) {
+				resident_rd_size = got;
+				print("system image from the volume: %x bytes\n", got);
+			}
+		}
 	}
 	if (resident_rd_size != 0) {
 		uint64_t res_pa = phys_base + RESIDENT_RD_OFFSET;
@@ -3206,6 +3272,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	print("cmdline: %d of %d characters\n", (uint64_t)n, (uint64_t)(BOOT_LINE_LENGTH - 1));
 
 	/* --- device tree ---------------------------------------------------- */
+	print("device tree: identity\n");
 	const struct platform *plat = PLAT;
 	struct dt_writer w = { .base = (uint8_t *)dt_pa, .cur = (uint8_t *)dt_pa, .end = (uint8_t *)(dt_pa + dt_max), .depth = 0 };
 	uint64_t cntfrq = READ_SYSREG(CNTFRQ_EL0);
@@ -3281,6 +3348,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_prop_u32(&w, "nvram-bank-count", 1);
 	dt_prop_u32(&w, "nvram-current-bank", 0);
 	dt_prop(&w, "nvram-proxy-data", nvram_image, sizeof(nvram_image));
+	print("device tree: memory map\n");
 	dt_begin(&w, "memory-map");
 	/*
 	 * "RAMDisk" becomes /dev/md0, the root (the kernel and launchd treat
@@ -3364,6 +3432,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	int cpu_count = 1, boot_core = (int)(kernel_mpidr >> plat->core_shift);
 
 	if (more_cores) {
+		print("cores: asking the firmware which ones are free\n");
 		for (int distance = 1; distance < plat->cores; distance++) {
 			for (int side = 0; side < 2; side++) {
 				int core = side == 0 ? boot_core + distance : boot_core - distance;
@@ -3378,6 +3447,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 					cpu_mpidr[cpu_count++] = mpidr;
 				} else if (state >= 0) {
 					print("core %x is not off (the firmware says %d): not the kernel's to take\n", mpidr, (uint64_t)state);
+				} else {
+					print("core %x: the firmware would not answer (returned %d)\n", mpidr, (uint64_t)state);
 				}
 			}
 		}
@@ -4253,6 +4324,56 @@ close:
 }
 
 /*
+ * Read a file from the volume this loader was started from, straight into dst, at most max_size bytes.
+ * Returns the number of bytes read - the file's size - or 0 for "no such file, empty, bigger than
+ * max_size, or could not be read to its end". Modeled on load_payload_from_volume above; the
+ * contents themselves are not checked for anything.
+ */
+static uint64_t
+read_volume_file(const char16 *path, uint64_t dst, uint64_t max_size)
+{
+	static const efi_guid image_guid = EFI_LOADED_IMAGE_GUID, fs_guid = EFI_SIMPLE_FILE_SYSTEM_GUID,
+	    info_guid = EFI_FILE_INFO_GUID;
+	efi_loaded_image *image = NULL;
+	efi_simple_fs *fs = NULL;
+	efi_file *root = NULL, *file = NULL;
+	uint8_t info[512] __attribute__((aligned(8)));
+	uint64_t info_size = sizeof(info), size = 0, done = 0;
+
+	if (EFI_ERROR(BS->handle_protocol(IMAGE, &image_guid, (void **)&image)) || image == NULL || image->device == NULL ||
+	    EFI_ERROR(BS->handle_protocol(image->device, &fs_guid, (void **)&fs)) || fs == NULL) {
+		return 0;
+	}
+	if (EFI_ERROR(fs->open_volume(fs, &root)) || root == NULL) {
+		return 0;
+	}
+	if (EFI_ERROR(root->open(root, &file, path, EFI_FILE_MODE_READ, 0)) || file == NULL) {
+		root->close(root);
+		return 0;
+	}
+	if (EFI_ERROR(file->get_info(file, &info_guid, &info_size, info))) {
+		goto none;
+	}
+	size = *(uint64_t *)(info + EFI_FILE_INFO_FILE_SIZE_OFFSET);
+	if (size == 0 || size > max_size) {
+		goto none;
+	}
+	while (done < size) {
+		uint64_t chunk = size - done < 0x100000ULL ? size - done : 0x100000ULL;       /* 1 MiB at a time */
+
+		if (EFI_ERROR(file->read(file, &chunk, (void *)(uintptr_t)(dst + done))) || chunk == 0) {
+			size = 0;
+			goto none;
+		}
+		done += chunk;
+	}
+none:
+	file->close(file);
+	root->close(root);
+	return size;
+}
+
+/*
  * The version of the kernel in the payload (the entry kernel.ver, made by xnuloader/mkpayload.py from
  * tools/kernel-version.py), or NULL if the payload has none. A look at the payload that changes
  * nothing and prints nothing, so that the banner can use it before the rest of the loader runs.
@@ -4280,6 +4401,37 @@ payload_kernel_version(void)
 			return (const char *)(p + sizeof(*e));
 		}
 		p += sizeof(*e) + ((e->size + 15) & ~15u);
+	}
+	return NULL;
+}
+
+/*
+ * The machine this payload was made for, when its disk says so (the platform entry, made by
+ * mkpayload.py --platform NAME). A payload that says nothing is matched by the framebuffer
+ * addresses below, as a phone's is.
+ */
+static const char *
+payload_platform_name(void)
+{
+	const struct payload_header *ph = (const struct payload_header *)PAYLOAD_BASE;
+
+	if (ph->magic != PAYLOAD_MAGIC) {
+		return NULL;
+	}
+	const uint8_t *q = (const uint8_t *)(ph + 1), *end = q + payload_walk_size(ph->size);
+	while (q + sizeof(struct payload_entry) <= end) {
+		const struct payload_entry *e = (const struct payload_entry *)q;
+
+		if (e->name[0] == 0) {
+			break;
+		}
+		if ((uint64_t)e->size > (uint64_t)(end - (q + sizeof(*e)))) {
+			break;
+		}
+		if (str_eq(e->name, "platform")) {
+			return (const char *)(q + sizeof(*e));
+		}
+		q += sizeof(*e) + ((e->size + 15) & ~15u);
 	}
 	return NULL;
 }
@@ -4335,22 +4487,48 @@ efi_main(efi_handle image, efi_system_table *st)
 	    READ_SYSREG(ID_AA64MMFR0_EL1), READ_SYSREG(CNTFRQ_EL0), (uint64_t)(uintptr_t)&__ImageBase);
 
 	PLAT = &platform_qemu_virt;
+	/* a disk that says what machine it is for wins over any address matching (see above) */
+	const char *declared = payload_platform_name();
+
+	if (declared != NULL) {
+		if (str_eq(declared, "gaokun3")) {
+			PLAT = &platform_gaokun3;
+		} else if (str_eq(declared, "redwood")) {
+			PLAT = &platform_redwood;
+		} else {
+			print("the payload asks for an unknown platform \"%s\", standing by\n", declared);
+			reboot();
+		}
+	}
 	if (EFI_ERROR(BS->locate_protocol(&gop_guid, NULL, (void **)&GOP)) || GOP->mode == NULL ||
 	    GOP->mode->info == NULL || GOP->mode->fb_base == 0) {
-		GOP = NULL;                     /* no display (QEMU without -device ramfb) */
+		GOP = NULL;                     /* no display: this firmware gives the text console but not a GOP of ours */
 	} else {
 		SCREEN.base = GOP->mode->fb_base;
 		SCREEN.width = GOP->mode->info->width;
 		SCREEN.height = GOP->mode->info->height;
 		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
-		if (SCREEN.base == 0xE1000000ULL) {
-			PLAT = &platform_redwood;
-		} else {
-			ramfb_phone_screen();
+		if (declared == NULL) {
+			if (SCREEN.base == 0xE1000000ULL) {
+				PLAT = &platform_redwood;
+			} else if (SCREEN.base == 0xC6200000ULL) {
+				PLAT = &platform_gaokun3;   /* the MateBook E Go's device-tree framebuffer, if the firmware shows it */
+			} else {
+				ramfb_phone_screen();       /* QEMU: ask for the phone's screen size on the emulated display */
+			}
 		}
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 	}
-	print("platform %s\n", PLAT->name);
+	if (SCREEN.base == 0 && PLAT->fb_base != 0) {
+		/* no GOP from the firmware, but this machine's own device tree describes its panel */
+		SCREEN.base = PLAT->fb_base;
+		SCREEN.width = PLAT->fb_width;
+		SCREEN.height = PLAT->fb_height;
+		SCREEN.stride = PLAT->fb_stride;
+		print("display %d x %d at %x (from the machine's own device tree)\n",
+		    (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
+	}
+	print("platform %s%s\n", PLAT->name, declared != NULL ? " (declared by the payload)" : "");
 
 	install_exception_hook();
 	wdt_arm();
