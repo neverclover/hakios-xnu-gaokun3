@@ -911,7 +911,7 @@ himax_raw_frames(void)
 		printf("himax: the raw-frame select could not be set\n");
 		return false;
 	}
-	printf("himax: raw frame select written %#x, read back %#x %#x %#x %#x%s\n", HIMAX_DATA_RAW_OUT_SEL,
+	say_both("himax: raw frame select written %#x, read back %#x %#x %#x %#x%s\n", HIMAX_DATA_RAW_OUT_SEL,
 	    answer[0], answer[1], answer[2], answer[3],
 	    answer[0] == HIMAX_DATA_RAW_OUT_SEL ? "" : " (NOT what was asked: the frames below may not decode)");
 	return true;
@@ -1096,6 +1096,11 @@ himax_centroid(const struct himax_peak *peak, uint32_t *sx, uint32_t *sy)
 /* What has been seen so far: said once a minute, so that the end of the log always tells. */
 static struct {
 	uint32_t polls, reports, touches, bad, last_x, last_y;
+	uint32_t smin, smax;                  /* the sample values over all frames: an untouched panel rests at 0x8000 */
+	uint32_t types[4];                  /* how the stack's first data byte reads: the types the vendor names, and others */
+	uint32_t excited;                   /* frames where the range says something moved */
+	uint8_t excited_bytes[16];          /* how the first such frame began
+*/
 } seen;
 
 /*
@@ -1186,6 +1191,59 @@ himax_report(unsigned count, const uint32_t *sx, const uint32_t *sy)
 	}
 }
 
+/*
+ * What the stack actually holds: the first bytes of a frame, the range the samples live in, how
+ * many frames show anything moving. The comment above the decoder says the first thing to question
+ * when the samples do not rest at 0x8000 is the matrix offset, and the second is the framing; this
+ * is what would say so, in the same export as everything else.
+ */
+static void
+himax_forensics(void)
+{
+	const uint8_t *m = himax_rx + HIMAX_BUS_R_HLEN;
+	uint32_t lo = 0xffffffffu, hi = 0;
+
+	switch (m[3]) {
+		case 0x01:
+			seen.types[0]++;
+			break;
+		case 0x02:
+			seen.types[1]++;
+			break;
+		case 0x05:
+		case 0x07:
+			seen.types[2]++;
+			break;
+		default:
+			seen.types[3]++;
+			break;
+	}
+	for (uint32_t i = HIMAX_FRAME_OFF; i + 1 < HIMAX_REPORT_BYTES; i += 2 * 7) {
+		uint32_t v = le16(m + i);
+
+		if (v < lo) {
+			lo = v;
+		}
+		if (v > hi) {
+			hi = v;
+		}
+	}
+	if (!seen.smin || lo < seen.smin) {
+		seen.smin = lo;
+	}
+	if (hi > seen.smax) {
+		seen.smax = hi;
+	}
+	if (hi > lo + 0x2000) {
+		if (seen.excited < 3) {
+			for (int i = 0; i < 16; i++) {
+				seen.excited_bytes[i] = m[i];
+			}
+		}
+		seen.excited++;
+	}
+}
+
 /* Burst-read the frame and turn its peaks into fingers. */
 static void
 himax_poll(void)
@@ -1208,6 +1266,7 @@ himax_poll(void)
 		goto bad;
 	}
 	seen.reports++;
+	himax_forensics();
 	for (unsigned i = 0; i < HIMAX_MAX_CONTACTS; i++) {
 		contact[i].seen = false;
 	}
@@ -1359,7 +1418,7 @@ bring_up(void)
 static const char *
 hexbytes(const uint8_t *b, uint32_t n)
 {
-	static char bufs[2][32];
+	static char bufs[2][48];
 	static int which;
 	char *out = bufs[which = !which];
 	int k = 0;
@@ -1381,6 +1440,12 @@ say_evidence(void)
 	    "the engine's flags %#x, its state %#x\n",
 	    last_txn.seq, last_txn.len, hexbytes(last_txn.tx, last_txn.len),
 	    last_txn.received, hexbytes(last_txn.rx, last_txn.received), last_txn.irq, last_txn.engine);
+	if (seen.reports) {
+		say_both("himax: the stack itself: first bytes (%s); samples range %#x..%#x where an untouched panel "
+		    "rests at 0x8000; first-byte counts %u %u %u %u; frames where something moved: %u\n",
+		    hexbytes(seen.excited_bytes, seen.excited ? 16u : 0u), seen.smin, seen.smax,
+		    seen.types[0], seen.types[1], seen.types[2], seen.types[3], seen.excited);
+	}
 }
 
 /* what the driver already tried on its own, so the reader can weigh the rest without another boot */
