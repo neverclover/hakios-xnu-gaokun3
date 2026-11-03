@@ -12,6 +12,7 @@
  * Only valid while the kernel does not drive hardware that UEFI also uses.
  */
 #include <mach/mach_types.h>
+#include <stdarg.h>
 #include <machine/atomic.h>
 #include <kern/cpu_number.h>
 #include <kern/debug.h>
@@ -75,6 +76,49 @@ static uint32_t loader_log_ring_at;      /* where the next character goes in the
 static bool     loader_log_wrapped;
 static bool     loader_log_linear;       /* the pieces have been put in order: only appending from now on */
 static char     loader_log_scratch[LOADER_LOG_RING];
+
+/*
+ * A channel the drivers talk to on purpose: a small ring of their standing-by lines, kept apart
+ * from the log so that a busy user space cannot bury a status line the way it buries everything
+ * else. What a loader shows of the log is the last of it; what it shows of this is the whole of
+ * it, which is why it is small. Writers race on purpose: a garbled state line is still a state
+ * line, and a lock here would put a sleeping driver in front of the interrupt it reports.
+ */
+#define LOADER_STATUS_SIZE      4096
+static char     loader_status_ring[LOADER_STATUS_SIZE];
+static uint32_t loader_status_at;         /* where the next character goes */
+static uint32_t loader_status_len;        /* how much of it has been filled */
+
+/* the kernel core defines it (kern/misc.c); osfmk's own headers do not say so */
+extern int      vsnprintf(char *, size_t, const char *, va_list) __printflike(3, 0);
+
+void
+loader_status(const char *fmt, ...)
+{
+	char line[512];
+	va_list list;
+	int n;
+
+	va_start(list, fmt);
+	n = vsnprintf(line, sizeof(line), fmt, list);
+	va_end(list);
+	if (n < 0) {
+		return;
+	}
+	if (n > (int)sizeof(line) - 1) {
+		n = (int)sizeof(line) - 1;
+	}
+	for (int i = 0; i < n; i++) {
+		loader_status_ring[loader_status_at++] = line[i];
+		if (loader_status_at == LOADER_STATUS_SIZE) {
+			loader_status_at = 0;
+		}
+		if (loader_status_len < LOADER_STATUS_SIZE) {
+			loader_status_len++;
+		}
+	}
+}
+
 
 /*
  * Characters come from every processor, and from interrupt handlers on top of whatever was
@@ -200,6 +244,11 @@ struct loader_live {
 	volatile uint64_t stop;         /* the loader's to write: the host has asked for the run to end */
 	uint64_t magic2;                /* "XNULIVE2": what follows is there (a loader may meet an older kernel) */
 	const uint64_t *sound;          /* loader_sound: the same for a recording of the sound */
+	uint64_t magic3;                /* "XNULIVE3": the drivers' state channel follows */
+	const char *status;             /* loader_status */
+	const uint32_t *status_len;     /* how much of the ring is filled */
+	const uint32_t *status_at;      /* where the next character goes */
+	uint64_t status_size;           /* the ring's size */
 };
 
 /*
@@ -215,6 +264,8 @@ struct loader_live loader_live = {
 	.log_wrapped = &loader_log_wrapped, .log_head = LOADER_LOG_HEAD, .log_ring = LOADER_LOG_RING,
 	.recording = loader_recording,
 	.magic2 = 0x324556494c554e58ULL, .sound = loader_sound,
+	.magic3 = 0x334556494c554e58ULL, .status = loader_status_ring, .status_len = &loader_status_len,
+	.status_at = &loader_status_at, .status_size = LOADER_STATUS_SIZE,
 };
 
 /* Valid from the first instruction of C code: does not depend on gVirtBase/gPhysBase being set up. */

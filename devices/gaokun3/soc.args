@@ -1,0 +1,25 @@
+# devices/gaokun3/soc.args: SoC facts read out of this device's own device tree, as kernel boot-args.
+#
+# Source: mainline Linux 7.3 arch/arm64/boot/dts/qcom/sc8280xp-huawei-gaokun3.dts (compiled with cpp+dtc
+# on this machine to a .dtb; `tools/soc-args.py` reads it but only understands one-cell address trees, so
+# the values below were taken node by node from the same source).
+#
+# The result is redwood's README example in the other direction: **every value equals the kernel's
+# SC7280-family default** (drivers/modem/hakios.mpss.c soc_override()). ipcc 0x408000, aoss-qmp 0xc300000,
+# apps_rsc 0x18220000, apps_smmu 0x15000000, smem 0x80900000 and cmd_db 0x80860000 are byte-for-byte the
+# numbers the reference phone's soc.args shows. So this file changes nothing today; it is kept as the record
+# that they were checked against this device's own tree.
+#
+# What SC8280XP does not have in the mainline tree: no qcom,ipa / ipa_fws / apps-mmss nodes at all (the IPA
+# on this SoC is a newer generation; the reference phone's IPA 4.11 driver work does not apply). The modem
+# bring-up, if ported, is a larger port than soc.args ("a different IPA version is a larger port").
+
+soc_ipcc=0x408000          # mailbox@408000 qcom,sc8280xp-ipcc        (kernel default: same)
+soc_aoss=0xc300000         # power-management@c300000 qcom,aoss-qmp   (kernel default: same)
+soc_rsc=0x18220000         # rsc@18200000 drv-2 (the apps DRV)        (kernel default: same)
+soc_apps_smmu=0x15000000   # iommu@15000000 qcom,sc8280xp-smmu-500   (kernel default: same)
+soc_smem=0x80900000        # smem-region@80900000 qcom,smem           (kernel default: same)
+soc_cmd_db=0x80860000      # cmd-db-region@80860000 qcom,cmd-db       (kernel default: same)
+
+# not present on this SoC's tree (IPA generation differs; leave the defaults unused):
+#   soc_ipa_base, soc_gsi_base, soc_mpss_mem, modem_ipa_fw_at, soc_imem, soc_ipa_stream(_uc), soc_pas_mpss/ipa, soc_ipa_fw

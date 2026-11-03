@@ -59,6 +59,10 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
 
+/* the loader's state channel (osfmk/arm64/loader_return.c): a standing-by line belongs there as
+ * much as in the log -- the log is what the moment looks like, this is what the driver is. */
+extern void loader_status(const char *fmt, ...) __printflike(1, 2);
+
 /* RPMh's sequencer (TCS 0 of the RSC): the audio DSP's and the modem's drivers write the same slots, so every request goes through this lock */
 extern lck_mtx_t hakios_rsc_lock;
 
@@ -1268,6 +1272,21 @@ bring_up(void)
 	return 1;
 }
 
+/* Say it to both channels: the log carries it past whoever has the screen that second, the
+ * state channel keeps it where a reader can still find it minutes later. */
+static void __printflike(1, 2)
+say_both(const char *fmt, ...)
+{
+	char line[512];
+	va_list list;
+
+	va_start(list, fmt);
+	vsnprintf(line, sizeof(line), fmt, list);
+	va_end(list);
+	printf("%s", line);
+	loader_status("%s", line);
+}
+
 static void
 himax_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -1297,7 +1316,7 @@ himax_thread(__unused void *parameter, __unused wait_result_t result)
 		 * stopped and what the lines read now; touch nothing else. */
 		for (;;) {
 			sleep_us(30 * 1000 * 1000);
-			printf("himax: standing by: it got as far as stage %u of 5; the interrupt line is %s, "
+			say_both("himax: standing by: it got as far as stage %u of 5; the interrupt line is %s, "
 			    "the reset line is %s; the engine's clock branch reads %#x, the votes %#x\n",
 			    reached > STAGE_REPORTS ? STAGE_REPORTS : reached,
 			    gpio_get(PIN_INT) ? "high" : "low",
@@ -1321,7 +1340,7 @@ himax_thread(__unused void *parameter, __unused wait_result_t result)
 			himax_poll();
 		}
 		if (tick % (30 * (1000000 / poll_us)) == 0) {
-			printf("himax: so far %u frames in %u looks (%u bad), %u finger positions, the last at %u, %u; "
+			say_both("himax: so far %u frames in %u looks (%u bad), %u finger positions, the last at %u, %u; "
 			    "interrupt line %s; the line looked at every %u us\n",
 			    seen.reports, seen.polls, seen.bad, seen.touches, seen.last_x, seen.last_y,
 			    gpio_get(PIN_INT) ? "high" : "low", poll_us);

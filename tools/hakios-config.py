@@ -81,6 +81,7 @@ SYMBOLS = [
                                             "acts only on a known charge, with a battery and no charger: for a run nobody watches", None, None),
     ("BATTERY_STOP_POLL", "int", "battery_stop_poll", "how often the battery guard looks, in seconds (5 to 600; 20)", None, "BATTERY_STOP"),
     ("PMIC", "bool", "pmic", "list every block of the power-management chips the SPMI arbiter shows, and read the PMIC's clock; read only", None, None),
+    ("CPUFREQ_DOMAINS", "int", "cpufreq_domains", "how many EPSS clock blocks this chip has: cores split into that many groups (2 for a two-cluster chip like the SC8280XP; 3 where the loader says)", None, "CPUFREQ"),
     # Linux's CONFIG_CMDLINE: whatever the symbols above do not cover, as name=value words in quotes. It is not an escape
     # from the checks: every name must be one the source reads (configs/boot-args.lst), so a typo is an error, not a no-op.
     ("BOOTARGS", "args", None, "more kernel arguments, as `name=value` words in quotes; each name must be one docs/boot-args.md lists", None, None),
@@ -98,6 +99,7 @@ GROUP_OF = {
     "NET_TRACE": "Network", "NET_NAMES": "Network", "VIRTIO_NET": "Network",
     "BATTERY_STOP": "Audio and battery", "BATTERY_STOP_POLL": "Audio and battery", "SOCINFO": "Chip, thermal and PMIC", "THERMAL": "Chip, thermal and PMIC", "THERMAL_POLL": "Chip, thermal and PMIC",
     "THERMAL_STOP": "Chip, thermal and PMIC", "PMIC": "Chip, thermal and PMIC", "BOOTARGS": "Extra arguments",
+    "CPUFREQ_DOMAINS": "CPU, memory and boot",
 }
 LAYER_OF = {}
 RELAXED = re.compile(r"[A-Za-z0-9_.,:/+@=\-]+")       # what a text value may hold: no space, no quote, no backslash
@@ -315,7 +317,7 @@ for _d in DRIVERS:
 SYMBOLS[3:3] = driver_symbols(DRIVERS)      # after the build facts: they are facts about the build as well
 BY_NAME = {s[0]: s for s in SYMBOLS}
 FIRMWARE_VALUES = ("device", "none")
-RANGES = {"CPUS": (1, 8), "BOOTCPU": (0, 7), "UFS": (1, 2), "THERMAL_POLL": (200, 60000), "THERMAL_STOP": (0, 160), "BATTERY_STOP": (0, 99), "BATTERY_STOP_POLL": (5, 600)}
+RANGES = {"CPUS": (1, 8), "BOOTCPU": (0, 7), "CPUFREQ_DOMAINS": (1, 3), "UFS": (1, 2), "THERMAL_POLL": (200, 60000), "THERMAL_STOP": (0, 160), "BATTERY_STOP": (0, 99), "BATTERY_STOP_POLL": (5, 600)}
 
 
 # ---- reading and writing --------------------------------------------------------------------------------------

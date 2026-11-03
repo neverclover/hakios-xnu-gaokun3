@@ -77,12 +77,25 @@ loop_speed(void)
 	return nanos ? (uint32_t)(2000000ULL * 1000 / nanos) : 0;
 }
 
-/* The group of the core with that number in its MPIDR (the device tree's "reg": the number is the second field). */
+/*
+ * The group of the core with that number in its MPIDR (the device tree's "reg": the number is the
+ * second field). The reference phone has three clusters and three EPSS blocks; a two-cluster chip
+ * (SC8280XP: four X1c, four A78c) has two, and there is nothing to read where a third would be.
+ * Boot-arg cpufreq_domains= counts the blocks, and the cores split into that many.
+ */
+static unsigned epss_domains = EPSS_DOMAINS;
+
 static uint32_t
 domain_of(uint32_t phys_id)
 {
 	uint32_t core = (phys_id >> 8) & 0xff;
 
+	if (epss_domains <= 2) {
+		/* numbered 0-3 are the X1c, 4-7 the A78c; the machine's own log said which EPSS is
+		 * which: the block at +0 has a table topping out at 2438 MHz (the A78c's), the one
+		 * at +0x1000 at 2995 (the X1c's). */
+		return core < 4 ? 1 : 0;
+	}
 	return core < 4 ? 0 : core < 7 ? 1 : 2;
 }
 
@@ -575,13 +588,17 @@ hakios_cpufreq_init(void)
 	if (!PE_parse_boot_argn("cpufreq", &enabled, sizeof(enabled)) || !enabled) {
 		return;
 	}
+	enabled = 0;
+	if (PE_parse_boot_argn("cpufreq_domains", &enabled, sizeof(enabled)) && enabled >= 1 && enabled <= EPSS_DOMAINS) {
+		epss_domains = enabled;
+	}
 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
 		cores[domain_of(topology->cpus[i].phys_id)]++;
 	}
 	/* (whichever core this thread happens to be on, and stays on or not: it only goes to the log) */
 	here = (uint32_t)(__builtin_arm_rsr64("MPIDR_EL1") >> 8) & 0xff;
 	before = loop_speed();
-	for (uint32_t domain = 0; domain < EPSS_DOMAINS; domain++) {
+	for (uint32_t domain = 0; domain < epss_domains; domain++) {
 		if (cores[domain] != 0) {
 			raise_domain(domain, cores[domain]);
 		}

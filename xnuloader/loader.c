@@ -932,6 +932,8 @@ struct kernel_live {
 	uint64_t stop;                  /* ours to write: the host wants the run to end ("oem stop") */
 	uint64_t magic2;                /* "XNULIVE2": the kernel is new enough to have what follows */
 	uint64_t sound;                 /* (a virtual address too) the same for a recording of the sound */
+	uint64_t magic3;                /* "XNULIVE3": the drivers' state channel follows */
+	uint64_t status, status_len, status_at, status_size;
 };
 
 /*
@@ -2297,7 +2299,8 @@ static void
 note_kernel_progress(const struct kernel_live *live, uint64_t slide, uint64_t seconds)
 {
 	const char *log;
-	uint32_t len, from;
+	uint32_t len, ring_at = 0, from, take = 512;
+	int wrapped = 0;
 
 	if (live == NULL) {
 		print("%d s\n", seconds);
@@ -2310,13 +2313,50 @@ note_kernel_progress(const struct kernel_live *live, uint64_t slide, uint64_t se
 	if (len > live->log_head + live->log_ring) {
 		len = 0;
 	}
-	from = len > 512 ? len - 512 : 0;   /* a driver's standing-by line is meant to fit whole */
-	flush_dcache((uint64_t)(uintptr_t)log + from, (uint64_t)(uintptr_t)log + len);
+	if (len == live->log_head + live->log_ring) {
+		/* a full ring: the newest words are the ones that end where the writing is */
+		flush_dcache(live->log_ring_at + slide, live->log_ring_at + slide + 4);
+		ring_at = *(volatile uint32_t *)(live->log_ring_at + slide);
+		wrapped = ring_at < live->log_ring;
+	}
+	if (len < take) {
+		take = len;
+	}
+	flush_dcache((uint64_t)(uintptr_t)log, (uint64_t)(uintptr_t)log + len);
 	print("%d s: the kernel has logged %d bytes, heartbeat %d; the last of it:\n", seconds, (uint64_t)len, live->heartbeat);
-	for (uint32_t i = from; i < len; i++) {
-		put_char(log[i] >= 0x20 && log[i] < 0x7f ? log[i] : log[i] == '\n' ? '\n' : '.');
+	if (wrapped) {
+		const char *ring = log + live->log_head;
+		for (uint32_t i = take; i > 0; i--) {
+			char c = ring[(ring_at + live->log_ring - i) % live->log_ring];
+			put_char(c >= 0x20 && c < 0x7f ? c : c == '\n' ? '\n' : '.');
+		}
+	} else {
+		from = len > take ? len - take : 0;
+		for (uint32_t i = from; i < len; i++) {
+			char c = log[i];
+			put_char(c >= 0x20 && c < 0x7f ? c : c == '\n' ? '\n' : '.');
+		}
 	}
 	print("\n");
+	/* and the drivers' own standing-by notes, kept out of the flood on purpose */
+	if (live->magic3 == 0x334556494c554e58ULL && live->status != 0 && live->status_size != 0) {
+		const char *st = (const char *)(live->status + slide);
+		uint32_t sl, sa, ssz = (uint32_t)live->status_size, sn;
+
+		flush_dcache(live->status_len + slide, live->status_len + slide + 8);
+		sl = *(volatile uint32_t *)(live->status_len + slide);
+		sa = *(volatile uint32_t *)(live->status_at + slide);
+		if (sl > 0 && sa <= ssz) {
+			sn = sl > 700 ? 700 : sl;
+			flush_dcache((uint64_t)(uintptr_t)st, (uint64_t)(uintptr_t)st + ssz);
+			print("the drivers' own notes, most recent last:\n");
+			for (uint32_t i = sn; i > 0; i--) {
+				char c = st[(sa + ssz - i) % ssz];
+				put_char(c >= 0x20 && c < 0x7f ? c : c == '\n' ? '\n' : '.');
+			}
+			print("\n");
+		}
+	}
 }
 
 /* A call of the firmware's power interface, the way this platform makes them. */

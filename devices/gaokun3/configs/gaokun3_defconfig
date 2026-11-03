@@ -1,0 +1,13 @@
+# HakiOS defconfig for the Huawei MateBook E Go 2023 (gaokun3, SC8280XP / Snapdragon 8cx Gen 3, devices/gaokun3):
+# the common kernel's configuration, the SC8280XP SoC family's facts and this device's own, put together
+# the way Android puts a device's kernel configuration together.
+#
+# The open profile: this machine runs Windows/Linux and has no adb and no vendor firmware鍒嗗尯 to pull,
+# so nothing of the device's own firmware is loaded (no GPU, Wi-Fi, audio, camera or modem arguments).
+# The SoC-family drivers (socinfo, cpufreq, thermal, pmic) are built in; every phone driver of the
+# common repository is left out of the kernel until it has been made to work here.
+
+#include common_defconfig
+#include open.config
+#include sc8280xp.config
+#include gaokun3.config
