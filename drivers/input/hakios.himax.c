@@ -343,6 +343,7 @@ cx_domain_on(void)
 #define TCXO_HZ                 19200000
 
 static uint32_t se_source_hz;
+static char clock_note[96];              /* what the standing-by line should add when stage 2 is where it stopped */
 
 /*
  * Parent the engine's clock to the crystal, undivided: this very selector's frequency table has
@@ -358,32 +359,28 @@ clocks_on(void)
 	printf("himax: the votes read %#x, the branch states %#x %#x %#x, and the rate selector %#x %#x %#x %#x\n",
 	    rd(GCC_VOTE), rd(GCC_QUP0_M_AHB_CBCR), rd(GCC_QUP0_S_AHB_CBCR), rd(GCC_QUP0_SE6_CBCR), rd(GCC_QUP0_SE6_RCTR),
 	    rd(GCC_QUP0_SE6_CMD), rd(GCC_QUP0_SE6_CFG), rd(GCC_QUP0_SE6_DFSR));
-	if (rd(GCC_QUP0_SE6_DFSR) & 1) {
-		printf("himax: the selector has its preset rates enabled (%#x): writing a rate anyway and watching\n",
-		    rd(GCC_QUP0_SE6_DFSR));
-	}
-	wr(GCC_VOTE, rd(GCC_VOTE) | VOTE_QUP0_M_AHB | VOTE_QUP0_S_AHB | VOTE_QUP0_CORE | VOTE_QUP0_CORE_2X);
-	wr(GCC_QUP0_SE6_CFG, (rd(GCC_QUP0_SE6_CFG) & ~0x371fu) | 1);
-	wr(GCC_QUP0_SE6_CMD, rd(GCC_QUP0_SE6_CMD) | 1);
-	for (int i = 0; i < 500 && (rd(GCC_QUP0_SE6_CMD) & 1); i++) {
-		sleep_us(10);
-	}
-	if (rd(GCC_QUP0_SE6_CMD) & 1) {
-		printf("himax: the serial engine's clock does not take its configuration (%#x)\n", rd(GCC_QUP0_SE6_CMD));
-		return false;
-	}
-	printf("himax: the rate selector now reads %#x %#x %#x: the engine runs off the crystal at %u Hz\n",
-	    rd(GCC_QUP0_SE6_RCTR), rd(GCC_QUP0_SE6_CMD), rd(GCC_QUP0_SE6_CFG), TCXO_HZ);
-	se_source_hz = TCXO_HZ;
-	wr(GCC_VOTE, rd(GCC_VOTE) | VOTE_QUP0_SE6);
+	/*
+	 * Votes only: ask the clock controller to keep the wrapper's two core branches and the
+	 * engine's own branch enabled. The rate selector is not touched on purpose -- a QUPv3
+	 * selector's fields are not a QUPv2's, the firmware already feeds these engines from the
+	 * crystal, and the engine divides for the bus itself inside the serial engine. The phone's
+	 * driver wrote at its own offsets there and was harmless: that machine's selector already
+	 * wanted the same source. Here, writing there stalls the selector's UPDATE instead.
+	 */
+	wr(GCC_VOTE, rd(GCC_VOTE) | VOTE_QUP0_CORE | VOTE_QUP0_CORE_2X | VOTE_QUP0_SE6);
 	for (int i = 0; i < 1000; i++) {
-		if (!((rd(GCC_QUP0_M_AHB_CBCR) | rd(GCC_QUP0_S_AHB_CBCR) | rd(GCC_QUP0_SE6_CBCR)) & CLOCK_OFF)) {
+		if (!(rd(GCC_QUP0_SE6_CBCR) & CLOCK_OFF)) {
+			se_source_hz = TCXO_HZ;      /* the rate the firmware feeds it; the SE divides from that */
+			clock_note[0] = '\0';
+			printf("himax: the engine's branch is on (%#x); the engine's own divider works from %u Hz\n",
+			    rd(GCC_QUP0_SE6_CBCR), se_source_hz);
 			return true;
 		}
 		sleep_us(10);
 	}
-	printf("himax: clocks stay off: %#x %#x %#x\n", rd(GCC_QUP0_M_AHB_CBCR), rd(GCC_QUP0_S_AHB_CBCR),
-	    rd(GCC_QUP0_SE6_CBCR));
+	snprintf(clock_note, sizeof(clock_note), "the branch stayed off (%#x, votes %#x)",
+	    rd(GCC_QUP0_SE6_CBCR), rd(GCC_VOTE));
+	printf("himax: clocks stay off: %s\n", clock_note);
 	return false;
 }
 
@@ -1233,6 +1230,7 @@ bring_up(void)
 	problem = geni_spi_init(12000000);              /* the device tree's spi-max-frequency, as a ceiling */
 	if (problem != NULL) {
 		printf("himax: %s\n", problem);
+		snprintf(clock_note, sizeof(clock_note), "the engine itself said: %s", problem);
 		return -1;
 	}
 	spi_transfer = geni_transfer;
@@ -1317,11 +1315,12 @@ himax_thread(__unused void *parameter, __unused wait_result_t result)
 		for (;;) {
 			sleep_us(30 * 1000 * 1000);
 			say_both("himax: standing by: it got as far as stage %u of 5; the interrupt line is %s, "
-			    "the reset line is %s; the engine's clock branch reads %#x, the votes %#x\n",
+			    "the reset line is %s; the engine's clock branch reads %#x, the votes %#x%s%s\n",
 			    reached > STAGE_REPORTS ? STAGE_REPORTS : reached,
 			    gpio_get(PIN_INT) ? "high" : "low",
 			    gpio_get(PIN_RESET) ? "released (high, as it should be)" : "held low (the chip is in reset)",
-			    rd(GCC_QUP0_SE6_CBCR), rd(GCC_VOTE));
+			    rd(GCC_QUP0_SE6_CBCR), rd(GCC_VOTE),
+			    clock_note[0] ? "; " : "", clock_note);
 		}
 	}
 	if (up == 0) {
