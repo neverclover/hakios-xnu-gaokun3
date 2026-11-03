@@ -1257,13 +1257,28 @@ himax_poll(void)
 	if (!himax_set_burst_mode(true)) {
 		goto bad;
 	}
-	/* one burst: the chip starts at the event stack and auto-adds four per beat (the vendor's own chunked read) */
+	/*
+	 * The vendor's own function for this very machine reads the stack in trunks:
+	 * hx83121a_gaokun_read_event_stack() starts a new type-3 read at the event-stack register
+	 * again and again, and the chip's auto-increment carries the address on from where the last
+	 * trunk ended. Asked for all 4807 bytes in one breath, this IC says nothing at all -- the
+	 * whole reply is low, and the engine itself flags the over-long command. So: trunks, as
+	 * the machine's own driver does. The header bytes ride in front of the first one.
+	 */
 	memset(himax_rx, 0, total);
 	himax_tx[0] = HIMAX_FUNCTION_READ;
 	himax_tx[1] = HIMAX_AHB_ADDR_EVENT_STACK;
 	himax_tx[2] = 0x00;
-	if (!spi_transfer(himax_tx, himax_rx, total)) {
-		goto bad;
+	for (uint32_t done = 0; done < HIMAX_REPORT_BYTES; ) {
+		uint32_t trunk = HIMAX_REPORT_BYTES - done;
+
+		if (trunk > 1024) {
+			trunk = 1024;
+		}
+		if (!spi_transfer(himax_tx, himax_rx + HIMAX_BUS_R_HLEN + done, trunk)) {
+			goto bad;
+		}
+		done += trunk;
 	}
 	seen.reports++;
 	himax_forensics();
