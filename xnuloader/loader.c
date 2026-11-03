@@ -85,7 +85,7 @@ static efi_system_table *ST;
 static efi_boot_services *BS;
 static efi_handle IMAGE;
 
-static char log_buf[32768];
+static char log_buf[65536];   /* the live window writes more now: two status lines per snapshot */
 static uint32_t log_len;
 
 void *
@@ -2347,7 +2347,7 @@ note_kernel_progress(const struct kernel_live *live, uint64_t slide, uint64_t se
 		sl = *(volatile uint32_t *)(live->status_len + slide);
 		sa = *(volatile uint32_t *)(live->status_at + slide);
 		if (sl > 0 && sa <= ssz) {
-			sn = sl > 700 ? 700 : sl;
+			sn = sl > 1400 ? 1400 : sl;   /* a state line and its evidence line fit whole */
 			flush_dcache((uint64_t)(uintptr_t)st, (uint64_t)(uintptr_t)st + ssz);
 			print("the drivers' own notes, most recent last:\n");
 			for (uint32_t i = sn; i > 0; i--) {

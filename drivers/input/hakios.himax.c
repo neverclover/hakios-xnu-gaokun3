@@ -63,6 +63,13 @@ extern kern_return_t thread_terminate(thread_t thread);
  * much as in the log -- the log is what the moment looks like, this is what the driver is. */
 extern void loader_status(const char *fmt, ...) __printflike(1, 2);
 
+/* the two-channel voice and the evidence line are defined further down, with the thread that
+ * keeps them company; everyone who has something to say uses them */
+static const char *hexbytes(const uint8_t *b, uint32_t n);
+static void __printflike(1, 2) say_both(const char *fmt, ...);
+static void say_evidence(void);
+static void __printflike(1, 2) tried_this(const char *fmt, ...);   /* forward */
+
 /* RPMh's sequencer (TCS 0 of the RSC): the audio DSP's and the modem's drivers write the same slots, so every request goes through this lock */
 extern lck_mtx_t hakios_rsc_lock;
 
@@ -114,6 +121,7 @@ le16(const uint8_t *p)
 #define PIN_CS                  157
 #define PIN_INT                 175     /* low = the chip has a report */
 #define PIN_RESET               99      /* the device tree says active low: low = in reset, high = running */
+#define PIN_5V_EN               52      /* the device tree's vreg_avdd_5p5 enable: the chip's supply per its regulator node */
 #define PIN_FUNCTION_QUP        1       /* "qup6" as a number: the phone's driver writes the same 1 for its "qup15" group */
 
 static void
@@ -440,9 +448,10 @@ clocks_on(void)
 
 static uint32_t fifo_depth;
 
-/* 0 = ready; otherwise why the engine cannot be used */
+/* 0 = ready; otherwise why the engine cannot be used. mode3: clock idle high, data out on the
+ * falling edge, what the vendor asks for; the retry ladder tries mode 0 once if that is mute. */
 static const char *
-geni_spi_init(uint32_t hz)
+geni_spi_init(uint32_t hz, bool mode3)
 {
 	uint32_t divider, actual;
 
@@ -482,8 +491,8 @@ geni_spi_init(uint32_t hz)
 	 */
 	wr(SPI_LOOPBACK, 0);
 	wr(SPI_DEMUX_SEL, 0);
-	wr(SPI_CPHA, 1);
-	wr(SPI_CPOL, 1);
+	wr(SPI_CPHA, mode3 ? 1u : 0u);
+	wr(SPI_CPOL, mode3 ? 1u : 0u);
 	wr(SPI_DEMUX_OUTPUT_INV, 0);
 	wr(SPI_TRANS_CFG, rd(SPI_TRANS_CFG) & ~2u);
 	wr(GENI_TX_PACKING_CFG0, 0x0007f8fe);
@@ -555,6 +564,16 @@ geni_recover(void)
 	wr(GENI_M_IRQ_CLEAR, 0xffffffff);
 }
 
+/* What the last bus operation was, in full: the driver says "look at the evidence" and the
+ * standing-by line reproduces this. It is what a single boot can tell a reader at home. */
+struct txn_trace {
+	uint32_t seq;                     /* how many have been attempted */
+	uint32_t len, sent, received;
+	uint32_t irq, engine;             /* the engine's flags when it ended */
+	uint8_t tx[8], rx[8];             /* the first bytes of both directions */
+};
+static struct txn_trace last_txn;
+
 /* One transfer with the chip selected throughout: `length` bytes out (zeros without tx) and as many in. */
 static bool
 geni_transfer(const uint8_t *tx, uint8_t *rx, uint32_t length)
@@ -574,6 +593,13 @@ geni_transfer(const uint8_t *tx, uint8_t *rx, uint32_t length)
 	wr(SPI_TX_TRANS_LEN, length);
 	wr(SPI_RX_TRANS_LEN, length);
 	wr(GENI_M_CMD0, SPI_FULL_DUPLEX);
+	last_txn.seq++;
+	last_txn.len = length;
+	last_txn.sent = last_txn.received = last_txn.irq = last_txn.engine = 0;
+	for (uint32_t i = 0; i < 8 && i < length; i++) {
+		last_txn.tx[i] = tx ? tx[i] : 0;
+		last_txn.rx[i] = 0;
+	}
 	clock_interval_to_deadline(200, NSEC_PER_MSEC, &deadline);
 	while (mach_absolute_time() < deadline) {
 		while (sent < length && (rd(GENI_TX_FIFO_STATUS) & 0x0fffffff) + 1 < fifo_depth) {
@@ -592,6 +618,13 @@ geni_transfer(const uint8_t *tx, uint8_t *rx, uint32_t length)
 		if (status & M_CMD_DONE) {
 			geni_drain(rx, length, &received);
 			wr(GENI_M_IRQ_CLEAR, status);
+			for (uint32_t i = 0; i < 8 && i < received; i++) {
+				last_txn.rx[i] = rx ? rx[i] : 0;
+			}
+			last_txn.irq = status;
+			last_txn.engine = rd(GENI_STATUS);
+			last_txn.sent = sent;
+			last_txn.received = received;
 			if (received == length) {
 				return true;
 			}
@@ -602,6 +635,13 @@ geni_transfer(const uint8_t *tx, uint8_t *rx, uint32_t length)
 		printf("himax: SPI transfer of %u bytes failed: status %#x, sent %u, received %u\n", length, status, sent,
 		    received);
 	}
+	for (uint32_t i = 0; i < 8 && i < received; i++) {
+		last_txn.rx[i] = rx ? rx[i] : 0;
+	}
+	last_txn.irq = status;
+	last_txn.engine = rd(GENI_STATUS);
+	last_txn.sent = sent;
+	last_txn.received = received;
 	geni_recover();
 	return false;
 }
@@ -771,7 +811,7 @@ himax_interface_on(void)
 		}
 		if (himax_spi_read(HIMAX_AHB_ADDR_CONTI, &conti, 1) && himax_spi_read(HIMAX_AHB_ADDR_BURST, &burst, 1) &&
 		    conti == HIMAX_AHB_CMD_CONTI && burst == HIMAX_AHB_CMD_BURST) {
-			printf("himax: the bus is awake (its settings read %#x %#x)\n", conti, burst);
+			say_both("himax: the bus is awake (its settings read %#x %#x)\n", conti, burst);
 			return true;
 		}
 		printf("himax: the bus answers with its settings %#x %#x, not 0x31 0x10 (try %d)\n", conti, burst, attempt + 1);
@@ -822,7 +862,7 @@ himax_probe(void)
 		return false;
 	}
 	icid = data[0] | (uint32_t)data[1] << 8 | (uint32_t)data[2] << 16 | (uint32_t)data[3] << 24;
-	printf("himax: IC_ID (0x900000d0) is %#010x: a \"HX%06X\"\n", icid, icid >> 8 & 0xffffff);
+	say_both("himax: IC_ID (0x900000d0) is %#010x: a \"HX%06X\"\n", icid, icid >> 8 & 0xffffff);
 	if ((icid >> 8) != HIMAX_REG_DATA_ICID) {
 		printf("himax: that is NOT the 83121a this machine's device tree says it has\n");
 		snprintf(clock_note, sizeof(clock_note), "the chip answers as %#010x, not an 83121a", icid);
@@ -832,14 +872,15 @@ himax_probe(void)
 		return false;
 	}
 	id = data[0];
-	printf("himax: FW_STATUS (0x900000a8) is %#010x: state byte %#02x", data[0] | (uint32_t)data[1] << 8 |
-	    (uint32_t)data[2] << 16 | (uint32_t)data[3] << 24, id);
 	if (id != HIMAX_REG_DATA_FW_STATE_RUNNING) {
-		printf(": the firmware is NOT running (0x05 is running); stopping here\n");
+		say_both("himax: FW_STATUS (0x900000a8) is %#010x: state byte %#02x: the firmware is NOT running "
+		    "(0x05 is running); stopping here\n",
+		    data[0] | (uint32_t)data[1] << 8 | (uint32_t)data[2] << 16 | (uint32_t)data[3] << 24, id);
 		snprintf(clock_note, sizeof(clock_note), "the chip is a Himax but its firmware says state %#x, not running", id);
 		return false;
 	}
-	printf(": the firmware is running\n");
+	say_both("himax: FW_STATUS (0x900000a8) is %#010x: state byte %#02x: the firmware is running\n",
+	    data[0] | (uint32_t)data[1] << 8 | (uint32_t)data[2] << 16 | (uint32_t)data[3] << 24, id);
 	clock_note[0] = '\0';
 	return true;
 }
@@ -1234,7 +1275,7 @@ bring_up(void)
 		printf("himax: the engine's clocks cannot be turned on\n");
 		return -1;
 	}
-	problem = geni_spi_init(12000000);              /* the device tree's spi-max-frequency, as a ceiling */
+	problem = geni_spi_init(12000000, true);         /* the device tree's spi-max-frequency, as a ceiling */
 	if (problem != NULL) {
 		printf("himax: %s\n", problem);
 		snprintf(clock_note, sizeof(clock_note), "the engine itself said: %s", problem);
@@ -1262,7 +1303,35 @@ bring_up(void)
 	    "and identification\n");
 	himax_pin_reset();
 	if (!himax_probe()) {
-		return -1;
+		char first[170];
+		bool ok = false;
+
+		snprintf(first, sizeof(first), "%s", clock_note);      /* keep what the first try saw */
+		if (!(rd(GPIO_IO(PIN_5V_EN)) & 1)) {
+			/* the device tree says a 5.5 V rail, enabled on TLMM 52, is left always on: if the pad
+			 * reads low, that is the first thing a mute chip would answer to. Raise it and never
+			 * lower it again -- the panel's analog lives on this rail too. */
+			say_both("himax: the 5.5 V enable pad reads low (%s); raising it and asking again\n", first);
+			gpio_output(PIN_5V_EN, true, PULL_NONE, 2);
+			sleep_ms(60);
+			himax_pin_reset();
+			ok = himax_probe();
+			tried_this("raised the 5.5 V rail; ");
+		}
+		if (!ok) {
+			snprintf(first, sizeof(first), "%s", clock_note);
+			/* the vendor asks for mode 3; the retry ladder tries mode 0 once: a polarity guess
+			 * wrong costs one boot avoided. */
+			if (geni_spi_init(12000000, false) == NULL) {
+				spi_transfer = geni_transfer;
+				say_both("himax: still mute (%s); the engine asked again in mode 0\n", first);
+				ok = himax_probe();
+				tried_this("tried the engine in mode 0. ");
+			}
+		}
+		if (!ok) {
+			return -1;
+		}
 	}
 	reached = STAGE_CHIP;
 	if (stop_after == STAGE_CHIP) {
@@ -1275,6 +1344,47 @@ bring_up(void)
 		return -1;
 	}
 	return 1;
+}
+
+static const char *
+hexbytes(const uint8_t *b, uint32_t n)
+{
+	static char bufs[2][32];
+	static int which;
+	char *out = bufs[which = !which];
+	int k = 0;
+
+	if (n > 8) {
+		n = 8;
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		k += snprintf(out + k, sizeof(bufs[0]) - (size_t)k, "%02x ", b[i]);
+	}
+	return out;
+}
+
+/* What the last bus operation did, in one line a reader at home can weigh without another boot. */
+static void
+say_evidence(void)
+{
+	say_both("himax: evidence: bus operation %u: %u bytes out (%s), %u came back (%s); "
+	    "the engine's flags %#x, its state %#x\n",
+	    last_txn.seq, last_txn.len, hexbytes(last_txn.tx, last_txn.len),
+	    last_txn.received, hexbytes(last_txn.rx, last_txn.received), last_txn.irq, last_txn.engine);
+}
+
+/* what the driver already tried on its own, so the reader can weigh the rest without another boot */
+static char stage_actions[128];
+
+static void
+tried_this(const char *fmt, ...)
+{
+	va_list list;
+	size_t n = strlen(stage_actions);
+
+	va_start(list, fmt);
+	vsnprintf(stage_actions + n, sizeof(stage_actions) - n, fmt, list);
+	va_end(list);
 }
 
 /* Say it to both channels: the log carries it past whoever has the screen that second, the
@@ -1333,7 +1443,11 @@ himax_thread(__unused void *parameter, __unused wait_result_t result)
 			    gpio_get(PIN_RESET) ? "released (high, as it should be)" : "held low (the chip is in reset)",
 			    rd(GCC_QUP0_SE6_CBCR), rd(GCC_VOTE),
 			    rd(GPIO_CFG(52)), rd(GPIO_IO(52)) ? "high" : "low",
-			    clock_note[0] ? "; " : "", clock_note);
+			    clock_note[0] ? "; " : "", clock_note,
+			    stage_actions[0] ? "; already tried: " : "", stage_actions);
+			if (last_txn.seq) {
+				say_evidence();
+			}
 		}
 	}
 	if (up == 0) {
