@@ -343,7 +343,7 @@ cx_domain_on(void)
 #define TCXO_HZ                 19200000
 
 static uint32_t se_source_hz;
-static char clock_note[96];              /* what the standing-by line should add when stage 2 is where it stopped */
+static char clock_note[160];             /* the chip's stage notes: what the standing-by line adds when a stage fails */
 
 /*
  * Parent the engine's clock to the crystal, undivided: this very selector's frequency table has
@@ -762,6 +762,7 @@ himax_interface_on(void)
 	uint8_t byte, conti = 0, burst = 0;
 
 	if (!himax_spi_read(HIMAX_AHB_ADDR_RDATA_BYTE_0, &byte, 1)) {
+		snprintf(clock_note, sizeof(clock_note), "the chip gave no answer at all to the first read");
 		return false;
 	}
 	for (int attempt = 0; attempt < 10; attempt++) {
@@ -774,6 +775,8 @@ himax_interface_on(void)
 			return true;
 		}
 		printf("himax: the bus answers with its settings %#x %#x, not 0x31 0x10 (try %d)\n", conti, burst, attempt + 1);
+		snprintf(clock_note, sizeof(clock_note), "the bus answers %#x %#x where a woken chip answers 0x31 0x10 (tried %d times)",
+		    conti, burst, attempt + 1);
 		sleep_ms(1);
 	}
 	return false;
@@ -815,12 +818,14 @@ himax_probe(void)
 	 */
 	if (!himax_register_read(HIMAX_REG_ADDR_ICID, data, sizeof(data))) {
 		printf("himax: could not read the chip ID\n");
+		snprintf(clock_note, sizeof(clock_note), "the bus woke but the ID register would not answer");
 		return false;
 	}
 	icid = data[0] | (uint32_t)data[1] << 8 | (uint32_t)data[2] << 16 | (uint32_t)data[3] << 24;
 	printf("himax: IC_ID (0x900000d0) is %#010x: a \"HX%06X\"\n", icid, icid >> 8 & 0xffffff);
 	if ((icid >> 8) != HIMAX_REG_DATA_ICID) {
 		printf("himax: that is NOT the 83121a this machine's device tree says it has\n");
+		snprintf(clock_note, sizeof(clock_note), "the chip answers as %#010x, not an 83121a", icid);
 	}
 	if (!himax_register_read(HIMAX_REG_ADDR_FW_STATUS, data, sizeof(data))) {
 		printf("himax: could not read the firmware status\n");
@@ -831,9 +836,11 @@ himax_probe(void)
 	    (uint32_t)data[2] << 16 | (uint32_t)data[3] << 24, id);
 	if (id != HIMAX_REG_DATA_FW_STATE_RUNNING) {
 		printf(": the firmware is NOT running (0x05 is running); stopping here\n");
+		snprintf(clock_note, sizeof(clock_note), "the chip is a Himax but its firmware says state %#x, not running", id);
 		return false;
 	}
 	printf(": the firmware is running\n");
+	clock_note[0] = '\0';
 	return true;
 }
 
@@ -1314,12 +1321,18 @@ himax_thread(__unused void *parameter, __unused wait_result_t result)
 		 * stopped and what the lines read now; touch nothing else. */
 		for (;;) {
 			sleep_us(30 * 1000 * 1000);
+			/* the device tree says a 5.5 V rail is enabled by TLMM 52 and left always on by the
+			 * firmware: look at it, never touch it -- this is the rail the panel's analog lives on. */
+			printf("himax: the 5.5 V rail enable pin 52: config %#x, the pad %s\n",
+			    rd(GPIO_CFG(52)), rd(GPIO_IO(52)) ? "high" : "low");
 			say_both("himax: standing by: it got as far as stage %u of 5; the interrupt line is %s, "
-			    "the reset line is %s; the engine's clock branch reads %#x, the votes %#x%s%s\n",
+			    "the reset line is %s; the engine's clock branch reads %#x, the votes %#x; "
+			    "the 5.5 V rail enable pin 52: config %#x, the pad %s%s%s\n",
 			    reached > STAGE_REPORTS ? STAGE_REPORTS : reached,
 			    gpio_get(PIN_INT) ? "high" : "low",
 			    gpio_get(PIN_RESET) ? "released (high, as it should be)" : "held low (the chip is in reset)",
 			    rd(GCC_QUP0_SE6_CBCR), rd(GCC_VOTE),
+			    rd(GPIO_CFG(52)), rd(GPIO_IO(52)) ? "high" : "low",
 			    clock_note[0] ? "; " : "", clock_note);
 		}
 	}
