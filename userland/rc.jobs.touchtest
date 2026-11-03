@@ -11,4 +11,7 @@
 # through /dev/hakios-touch (rwtouch, src/rwtouch.c): if the ring, the node, the virtual HID in
 # backboardd, and SpringBoard all answer, the screen visibly goes home. This is the input path
 # proven without waiting for anyone's finger -- and it is what the operator can see for certain.
-/redwood/bin/rwtouch wait 90 button home
+# on the desktop a home press is invisible -- what is visible from anywhere is the notification
+# center: a drag down from the top edge. If the input path works, a panel slides down around
+# the ninetieth second, and slides away again when touched.
+/redwood/bin/rwtouch wait 90 swipe 0.5 0.01 0.5 0.6 400

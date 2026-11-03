@@ -1167,6 +1167,8 @@ static struct {
 static void
 himax_report(unsigned count, const uint32_t *sx, const uint32_t *sy)
 {
+	/* the ring's contract is the display in fractions of 65535, not pixels (sys/hakios.input.h) */
+	uint32_t post_x, post_y;
 	static unsigned shown;
 
 	for (unsigned i = 0; i < count; i++) {
@@ -1223,9 +1225,11 @@ himax_report(unsigned count, const uint32_t *sx, const uint32_t *sy)
 		contact[best].sy = y;
 		if (!contact[best].down) {
 			contact[best].down = true;
-			hakios_touch_post(HAKIOS_TOUCH_DOWN, best, panel_x, panel_y);
+			post_x = mult_frac(panel_x, 65535, PANEL_X - 1);
+			post_y = mult_frac(panel_y, 65535, PANEL_Y - 1);
+			hakios_touch_post(HAKIOS_TOUCH_DOWN, best, post_x, post_y);
 		} else if (contact[best].x != panel_x || contact[best].y != panel_y) {
-			hakios_touch_post(HAKIOS_TOUCH_MOVE, best, panel_x, panel_y);
+			hakios_touch_post(HAKIOS_TOUCH_MOVE, best, post_x, post_y);
 		}
 		contact[best].x = panel_x;
 		contact[best].y = panel_y;
@@ -1234,7 +1238,8 @@ himax_report(unsigned count, const uint32_t *sx, const uint32_t *sy)
 	for (unsigned id = 0; id < HIMAX_MAX_CONTACTS; id++) {
 		if (contact[id].down && !contact[id].seen) {
 			contact[id].down = false;
-			hakios_touch_post(HAKIOS_TOUCH_UP, id, contact[id].x, contact[id].y);
+			hakios_touch_post(HAKIOS_TOUCH_UP, id, mult_frac(contact[id].x, 65535, PANEL_X - 1),
+			    mult_frac(contact[id].y, 65535, PANEL_Y - 1));
 		}
 	}
 }
