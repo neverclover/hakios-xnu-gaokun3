@@ -1,0 +1,14 @@
+# Commands run by the launchd job com.hakios.demo (see com.hakios.demo.plist).
+/redwood/bin/hello_dyn started by launchd
+/redwood/bin/svc_test
+/redwood/bin/surf_test
+/bin/ps -A
+/redwood/bin/mg_test
+# the processors: how many, and -- once the system has settled -- whether they work at the same time
+/redwood/bin/cpu_test
+/redwood/bin/cpu_test 240 &
+# and one thing more than the tests: a hand that is not a finger. Ninety seconds in, press home
+# through /dev/hakios-touch (rwtouch, src/rwtouch.c): if the ring, the node, the virtual HID in
+# backboardd, and SpringBoard all answer, the screen visibly goes home. This is the input path
+# proven without waiting for anyone's finger -- and it is what the operator can see for certain.
+/redwood/bin/rwtouch wait 90 button home

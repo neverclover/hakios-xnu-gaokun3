@@ -26,6 +26,7 @@
 static uint32_t touch_lat = 2;          /* 2: not yet looked up */
 
 extern void loader_log_line(const char *line);
+extern void loader_status(const char *fmt, ...) __printflike(1, 2);   /* the drivers' state channel */
 
 /*
  * A "tl:" line, for the kernel's drivers: into the loader's log as it is written -- the kernel's own
@@ -143,6 +144,18 @@ hakios_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)
 static int
 touch_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
 {
+	/*
+	 * The first reader is the tell that the other half of the path -- the virtual HID service
+	 * that libhakios runs inside the window server -- is awake and looking. It belongs in the
+	 * state channel for exactly the reason the drivers' standing-by lines do: the moment it
+	 * happens, the log is full of other things.
+	 */
+	static bool reported;
+
+	if (!reported) {
+		reported = true;
+		loader_status("input: userland has opened the touch node\n");
+	}
 	return 0;
 }
 
@@ -223,6 +236,9 @@ hakios_input_init(void)
 
 	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "hakios-touch") == NULL) {
 		printf("hakios-touch: cannot create the device\n");
+		loader_status("input: the touch node could NOT be created\n");
+	} else {
+		loader_status("input: /dev/hakios-touch is up\n");
 	}
 	exit_call = thread_call_allocate(exit_hold_elapsed, NULL);
 	hakios_cpufreq_init();
