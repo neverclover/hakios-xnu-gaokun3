@@ -810,12 +810,22 @@ himax_interface_on(void)
 			return false;
 		}
 		if (himax_spi_read(HIMAX_AHB_ADDR_CONTI, &conti, 1) && himax_spi_read(HIMAX_AHB_ADDR_BURST, &burst, 1) &&
-		    conti == HIMAX_AHB_CMD_CONTI && burst == HIMAX_AHB_CMD_BURST) {
-			say_both("himax: the bus is awake (its settings read %#x %#x)\n", conti, burst);
+		    conti == HIMAX_AHB_CMD_CONTI && (burst & ~0x03u) == HIMAX_AHB_CMD_BURST) {
+			/*
+			 * The machine corrected me here, in its own words: this chip answers 0x31 0x13. The
+			 * low two bits of the burst setting are its auto-increment -- 3 means the bus adds
+			 * four per beat -- and that is exactly the state the vendor's driver asks for by
+			 * name (HIMAX_AHB_BURST_INCR4), on this chip, as its out-of-reset default: Huawei's
+			 * firmware works with it rather than against it. So the check takes the increment
+			 * bits as the chip's own report, and the decoding follows it.
+			 */
+			himax_incr4 = (burst & 0x03u) != 0;
+			say_both("himax: the bus is awake (its settings read %#x %#x; the increment by four it reports is %s)\n",
+			    conti, burst, himax_incr4 ? "on" : "off");
 			return true;
 		}
-		printf("himax: the bus answers with its settings %#x %#x, not 0x31 0x10 (try %d)\n", conti, burst, attempt + 1);
-		snprintf(clock_note, sizeof(clock_note), "the bus answers %#x %#x where a woken chip answers 0x31 0x10 (tried %d times)",
+		printf("himax: the bus answers with its settings %#x %#x, not 0x31 0x1x (try %d)\n", conti, burst, attempt + 1);
+		snprintf(clock_note, sizeof(clock_note), "the bus answers %#x %#x where a woken chip answers 0x31 0x1x (tried %d times)",
 		    conti, burst, attempt + 1);
 		sleep_ms(1);
 	}
