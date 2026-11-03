@@ -917,6 +917,54 @@ himax_raw_frames(void)
 	return true;
 }
 
+/*
+ * The sequence this firmware requires before it senses at all. The vendor's file for this machine
+ * annotates each step -- sorting mode and n-frame say "not needed on gaokun3", while clearing the
+ * reload flag and sense-on say "required". Without them the firmware runs (status 0x05, and that
+ * is what we read) but the analog front is never switched on, and the event stack answers every
+ * question with silence -- which is exactly what our frame forensics saw. The handshake: clear
+ * the flag, ask the firmware to re-initialise, pin reset, and wait for it to write its own
+ * address (0x72c0, little-endian) back into the flag register. Only then does it accept the raw
+ * frames request -- which the stage that follows writes again, after this, as the vendor does.
+ */
+static bool
+himax_gaokun_wake(void)
+{
+	uint8_t zeros[4] = { 0, 0, 0, 0 };
+	uint8_t data[4] = { 0 };
+	const uint32_t ctrl_fw = 0x9000005c;           /* the vendor's HIMAX_REG_ADDR_CTRL_FW */
+	const uint32_t reload_flag = 0x100072c0;       /* the vendor's 2ND_FLASH_RELOAD */
+
+	say_both("himax: doing what this firmware's driver calls the required steps: clear the reload "
+	    "flag, re-initialise, pin reset, wait for the handshake\n");
+	if (!himax_register_write(reload_flag, zeros, sizeof(zeros))) {
+		snprintf(clock_note, sizeof(clock_note), "the reload flag would not take the clearing write");
+		return false;
+	}
+	/* FW_RE_INIT is 0: the asking itself is a zero */
+	if (!himax_register_write(ctrl_fw, zeros, sizeof(zeros))) {
+		snprintf(clock_note, sizeof(clock_note), "the firmware would not take the re-initialise");
+		return false;
+	}
+	sleep_ms(10);
+	himax_pin_reset();
+	for (int i = 0; i < 30; i++) {
+		if (!himax_register_read(reload_flag, data, sizeof(data))) {
+			snprintf(clock_note, sizeof(clock_note), "the handshake register went mute mid-wait");
+			return false;
+		}
+		if (data[0] == 0xc0 && data[1] == 0x72 && data[2] == 0 && data[3] == 0) {
+			say_both("himax: the firmware wrote back its own address: the data is reloaded\n");
+			return true;
+		}
+		sleep_ms(30);
+	}
+	snprintf(clock_note, sizeof(clock_note), "the firmware never wrote the handshake (the flag reads %02x %02x %02x %02x)",
+	    data[0], data[1], data[2], data[3]);
+	say_both("himax: %s; asking for raw frames anyway and watching what the stack says\n", clock_note);
+	return false;
+}
+
 /* ---- the touch report ----------------------------------------------------------------------------- */
 
 /*
@@ -1423,6 +1471,7 @@ bring_up(void)
 		return 0;
 	}
 
+	himax_gaokun_wake();                   /* best effort: the note says what happened, the frames show too */
 	printf("himax: stage 5 of 5: the reports\n");
 	if (!himax_raw_frames()) {
 		return -1;
