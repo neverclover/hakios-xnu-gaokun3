@@ -1545,6 +1545,7 @@ himax_thread(__unused void *parameter, __unused wait_result_t result)
 			    "interrupt line %s; the line looked at every %u us\n",
 			    seen.reports, seen.polls, seen.bad, seen.touches, seen.last_x, seen.last_y,
 			    gpio_get(PIN_INT) ? "high" : "low", poll_us);
+			say_evidence();
 		}
 		sleep_us(poll_us);
 	}
