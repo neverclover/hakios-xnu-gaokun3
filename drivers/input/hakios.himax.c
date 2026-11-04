@@ -1036,6 +1036,7 @@ static bool matrix_swapped;                    /* decided once at the anchor, bo
 static bool matrix_raw;                          /* and whether the frame is raw capacitance or deltas -- also decided there */
 static uint32_t matrix_rest;                   /* percent of probe samples at their rest there */
 static uint32_t matrix_nosync;                 /* answers with no recognizable frame start */
+static uint32_t matrix_torn;                   /* frames whose matrix holds whole fields of zeros: the read fell mid-write */
 
 static uint16_t
 sample_at(const uint8_t *base, uint32_t word)
@@ -1051,6 +1052,30 @@ himax_anchor(void)
 	for (uint32_t i = 0; i < 32 && i + 2u * (HIMAX_MAX_TX * HIMAX_MAX_RX) <= HIMAX_MAX_READ; i++) {
 		if (himax_rx[i] == 0x5a && himax_rx[i + 1] == 0x5a) {
 			matrix_off = i + 2;
+			/*
+			 * A real matrix -- touched or not, raw or delta -- is never a field of exact zeros:
+			 * raw rests at 0x8000 and deltas wander around zero without sitting on it. Whole
+			 * fields of exact zeros mean the answer was not complete when it was taken: the
+			 * read fell between or inside writes. Refuse the frame; the next poll asks again.
+			 */
+			{
+				uint32_t zeros = 0, probe = 0;
+
+				for (int r = 0; r < HIMAX_MAX_TX; r += 3) {
+					for (int c = 0; c < HIMAX_MAX_RX; c += 7) {
+						uint16_t v = le16(himax_rx + matrix_off + 2u * ((uint32_t)r * HIMAX_MAX_RX + (uint32_t)c));
+
+						probe++;
+						if (v == 0) {
+							zeros++;
+						}
+					}
+				}
+				if (zeros * 3 > probe) {
+					matrix_torn++;
+					return false;
+				}
+			}
 			return true;
 		}
 	}
@@ -1112,7 +1137,7 @@ frame_validate(void)
 				}
 			}
 		}
-		if (!decided) {
+		if (!decided && best * 100 / probe >= 60) {
 			decided = true;
 			matrix_swapped = best_order != 0;
 			matrix_raw = best_kind != 0;
@@ -1135,6 +1160,8 @@ frame_validate(void)
 				}
 				printf("\n");
 			}
+		} else if (!decided) {
+			say_both("himax: first whole frame believes no reading clearly (best %u%%); asking again on the next\n", best * 100 / probe);
 		}
 	}
 	matrix_rest = best_rest();
@@ -1523,27 +1550,15 @@ himax_poll(void)
 
 	seen.polls++;
 	/*
-	 * One read per assertion of the line, and after it wait for the line to free: the event
-	 * stack is a queue of whole reports, and reading it on a level -- as the last round did --
-	 * catches half a report as often as a whole one. A half report is a matrix with its back
-	 * half zeros: the peaks of one hand scatter over the whole frame, and the merge of them
-	 * churns nine thousand times. The vendor's driver reads exactly once on exactly this
-	 * interrupt; this is that, with the level watched at 8 ms instead of an edge.
+	 * Read whenever the line says there is something -- and know why the line says it always:
+	 * this RawOut mode streams. The stack is a ring of whole reports pressed one after another,
+	 * the line stays low from the first one on, and the wait-for-free of the last round starved
+	 * the driver after a single frame. What is imperfect is not the pace but the moment: a read
+	 * can fall while the firmware is writing, and that torn frame -- the matrix half zeros --
+	 * is refused below, not decoded.
 	 */
-	{
-		int lvl = gpio_get(PIN_INT);
-		static bool read_since_assert;
-
-		if (read_since_assert) {
-			if (lvl == 0) {
-				return;                 /* the report was already taken; wait for the queue to empty */
-			}
-			read_since_assert = false;
-		}
-		if (lvl != 0) {
-			return;                     /* nothing has been offered since the last read */
-		}
-		read_since_assert = true;
+	if (gpio_get(PIN_INT)) {
+		return;
 	}
 	if (!himax_set_burst_mode(true)) {
 		goto bad;
@@ -1858,10 +1873,10 @@ himax_thread(__unused void *parameter, __unused wait_result_t result)
 			himax_poll();
 		}
 		if (tick % (30 * (1000000 / poll_us)) == 0) {
-			say_both("himax: so far %u frames in %u looks (%u bad, %u empty answers held back, %u extra peaks merged, %u without a frame start; anchored at byte %u as %s, %u%% at rest), %u finger positions (%u moves, the longest one drew %u), the last at %u, %u; "
+			say_both("himax: so far %u frames in %u looks (%u bad, %u empty answers held back, %u extra peaks merged, %u without a frame start, %u torn; anchored at byte %u as %s, %u%% at rest), %u finger positions (%u moves, the longest one drew %u), the last at %u, %u; "
 			    "interrupt line %s; the line looked at every %u us\n",
 			    seen.reports, seen.polls, seen.bad, seen.stale, seen.merged,
-			    matrix_nosync, matrix_off, matrix_raw ? "raw" : "delta", matrix_rest,
+			    matrix_nosync, matrix_torn, matrix_off, matrix_raw ? "raw" : "delta", matrix_rest,
 			    seen.touches, seen.moves, seen.trackmax,
 			    seen.last_x, seen.last_y,
 			    gpio_get(PIN_INT) ? "high" : "low", poll_us);
