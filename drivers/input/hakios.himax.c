@@ -1032,11 +1032,25 @@ mult_frac(uint32_t value, uint32_t multiply, uint32_t divide)
  * does not move. Anchor on it, per frame.
  */
 static uint32_t matrix_off;                    /* every frame says where; nothing assumed */
-static bool matrix_swapped;                    /* decided once at the anchor, both orders counted */
-static bool matrix_raw;                          /* and whether the frame is raw capacitance or deltas -- also decided there */
-static uint32_t matrix_rest;                   /* percent of probe samples at their rest there */
+static bool matrix_swapped;                    /* decided on the first frame: the order that sees more panels */
 static uint32_t matrix_nosync;                 /* answers with no recognizable frame start */
-static uint32_t matrix_torn;                   /* frames whose matrix holds whole fields of zeros: the read fell mid-write */
+static uint32_t matrix_torn;                   /* (kept for the statistics' history) whole-field-zero frames */
+static uint32_t matrix_rest;
+
+/*
+ * What each row of the matrix is. One number for the whole frame was the mistake several rounds
+ * made: the counts keep coming out as "half the cells look like raw capacitance at rest, half
+ * like deltas" -- which is not a coin toss, it is rows: this firmware's report carries arrays of
+ * both kinds (its own size arithmetic says the answer holds the matrix and other arrays
+ * besides). So ask every row on its own. Classes: 1 = raw capacitance (rest 0x8000),
+ * 2 = deltas (rest near zero), 3 = dead/unused (all exact zeros or all out of every band),
+ * 0 = mixed/unknown -- decoded as nothing, to be safe.
+ */
+#define ROW_RAW     1
+#define ROW_DELTA   2
+#define ROW_DEAD    3
+#define ROW_MIX     0
+static uint8_t row_class[HIMAX_MAX_TX];
 
 static uint16_t
 sample_at(const uint8_t *base, uint32_t word)
@@ -1049,33 +1063,14 @@ sample_at(const uint8_t *base, uint32_t word)
 static bool
 himax_anchor(void)
 {
-	for (uint32_t i = 0; i < 32 && i + 2u * (HIMAX_MAX_TX * HIMAX_MAX_RX) <= HIMAX_MAX_READ; i++) {
-		if (himax_rx[i] == 0x5a && himax_rx[i + 1] == 0x5a) {
+	/*
+	 * The frame start is `5a 5a a5` -- seen identical in every capture that had one -- and the
+	 * matrix begins two bytes after it. Search wider than 32 bytes: a good fifth of the answers
+	 * keep their head farther down the window, and refusing those is refusing real frames.
+	 */
+	for (uint32_t i = 0; i + 2u * (HIMAX_MAX_TX * HIMAX_MAX_RX) <= HIMAX_MAX_READ && i < 330; i++) {
+		if (himax_rx[i] == 0x5a && himax_rx[i + 1] == 0x5a && himax_rx[i + 2] == 0xa5) {
 			matrix_off = i + 2;
-			/*
-			 * A real matrix -- touched or not, raw or delta -- is never a field of exact zeros:
-			 * raw rests at 0x8000 and deltas wander around zero without sitting on it. Whole
-			 * fields of exact zeros mean the answer was not complete when it was taken: the
-			 * read fell between or inside writes. Refuse the frame; the next poll asks again.
-			 */
-			{
-				uint32_t zeros = 0, probe = 0;
-
-				for (int r = 0; r < HIMAX_MAX_TX; r += 3) {
-					for (int c = 0; c < HIMAX_MAX_RX; c += 7) {
-						uint16_t v = le16(himax_rx + matrix_off + 2u * ((uint32_t)r * HIMAX_MAX_RX + (uint32_t)c));
-
-						probe++;
-						if (v == 0) {
-							zeros++;
-						}
-					}
-				}
-				if (zeros * 3 > probe) {
-					matrix_torn++;
-					return false;
-				}
-			}
 			return true;
 		}
 	}
@@ -1083,88 +1078,103 @@ himax_anchor(void)
 	return false;
 }
 
+static int
+row_band(int order, uint32_t at)
+{
+	uint16_t v = le16(himax_rx + at);
+
+	if (order) {
+		v = (uint16_t)((v >> 8) | (v << 8));
+	}
+	if (v >= EQUILIBRIUM - 0x1000 && v <= EQUILIBRIUM + 0x1000) {
+		return 1;
+	}
+	if (v < 0x2800 || v >= 0xD800) {
+		return 2;
+	}
+	return 0;
+}
+
 /*
- * The first whole frame says what kind of frames these are. Both byte orders and both rests --
- * the quiet zero of deltas, the 0x8000 of raw capacitance -- are counted at the anchored place,
- * and the reading that believes the most becomes the reading. Then the frame itself is written
- * out: sampled rows of the matrix in hex, so that if any of this is still wrong the bytes say
- * so in the log and there is nothing left to guess. Once decided, kept -- a model that changes
- * with the luck of one frame was last round's mistake.
+ * Class every row, once per frame group (the first frame and then every 1024th): the answer is
+ * printed as a 40-character map, and the first time through, the rows of the frame itself are
+ * written out in hex -- bytes, not counts, so that anything still wrong can be read directly.
  */
 static uint32_t best_rest(void);
+static uint32_t row_counts[4];
 
 static void
-frame_validate(void)
+frame_map(void)
 {
-	static bool decided;
-	uint32_t cnt[2][2] = { { 0, 0 }, { 0, 0 } };   /* [order][0 = delta rest, 1 = raw rest] */
-	uint32_t probe = 0;
+	static bool shown;
+	int order_best = 0;
+	uint32_t seen_hit[2] = { 0, 0 };
+	char map[HIMAX_MAX_TX + 1];
+	uint32_t n_raw = 0, n_delta = 0, n_dead = 0, n_mix = 0;
 
 	for (int order = 0; order < 2; order++) {
-		for (int r = 0; r < HIMAX_MAX_TX; r += 3) {
-			for (int c = 0; c < HIMAX_MAX_RX; c += 7) {
-				uint16_t v = le16(himax_rx + matrix_off + 2u * ((uint32_t)r * HIMAX_MAX_RX + (uint32_t)c));
+		for (int r = 0; r < HIMAX_MAX_TX; r++) {
+			for (int c = 0; c < HIMAX_MAX_RX; c += 3) {
+				seen_hit[order] += row_band(order, matrix_off + 2u * ((uint32_t)r * HIMAX_MAX_RX + (uint32_t)c)) != 0;
+			}
+		}
+	}
+	matrix_swapped = seen_hit[1] > seen_hit[0];
 
-				if (order) {
-					v = (uint16_t)((v >> 8) | (v << 8));
-				}
-				if (v < 0x2800 || v >= 0xD800) {
-					cnt[order][0]++;
-				}
-				if (v >= EQUILIBRIUM - 0x1000 && v <= EQUILIBRIUM + 0x1000) {
-					cnt[order][1]++;
-				}
-			}
-		}
-		probe += 1;
-	}
-	probe = 0;
-	for (int r = 0; r < HIMAX_MAX_TX; r += 3) {
-		for (int c = 0; c < HIMAX_MAX_RX; c += 7) {
-			probe++;
-		}
-	}
-	{
-		uint32_t best = 0;
-		int best_order = 0, best_kind = 0;
+	for (int r = 0; r < HIMAX_MAX_TX; r++) {
+		int raw = 0, delta = 0, zero = 0, total = 0;
 
-		for (int order = 0; order < 2; order++) {
-			for (int kind = 0; kind < 2; kind++) {
-				if (cnt[order][kind] > best) {
-					best = cnt[order][kind];
-					best_order = order;
-					best_kind = kind;
-				}
+		for (int c = 0; c < HIMAX_MAX_RX; c += 3) {
+			uint32_t at = matrix_off + 2u * ((uint32_t)r * HIMAX_MAX_RX + (uint32_t)c);
+			int band = row_band(matrix_swapped ? 1 : 0, at);
+
+			total++;
+			if (le16(himax_rx + at) == 0) {
+				zero++;
 			}
+			raw += band == 1;
+			delta += band == 2;
 		}
-		if (!decided && best * 100 / probe >= 60) {
-			decided = true;
-			matrix_swapped = best_order != 0;
-			matrix_raw = best_kind != 0;
-			say_both("himax: the first whole frame at byte %u: order L delta %u%% raw %u%%, order B delta %u%% raw %u%% -- reading as %s %s\n",
-			    matrix_off, cnt[0][0] * 100 / probe, cnt[0][1] * 100 / probe,
-			    cnt[1][0] * 100 / probe, cnt[1][1] * 100 / probe,
-			    matrix_swapped ? "big-endian" : "little-endian",
-			    matrix_raw ? "raw capacitance" : "deltas");
-			if (matrix_off >= 6) {
-				printf("himax: frame at byte %u begins:", matrix_off - 6);
-				for (int i = 0; i < 6; i++) {
-					printf(" %02x", himax_rx[matrix_off - 6 + (uint32_t)i]);
-				}
-				printf("\n");
-			}
-			for (int r = 0; r < HIMAX_MAX_TX; r += 4) {
-				printf("himax: row %02d:", r);
-				for (int c = 0; c < HIMAX_MAX_RX; c += 5) {
-					printf(" %04x", le16(himax_rx + matrix_off + 2u * ((uint32_t)r * HIMAX_MAX_RX + (uint32_t)c)));
-				}
-				printf("\n");
-			}
-		} else if (!decided) {
-			say_both("himax: first whole frame believes no reading clearly (best %u%%); asking again on the next\n", best * 100 / probe);
+		if (raw * 10 >= total * 7) {
+			row_class[r] = ROW_RAW;
+			map[r] = 'R';
+			n_raw++;
+		} else if (delta * 10 >= total * 7) {
+			row_class[r] = ROW_DELTA;
+			map[r] = 'D';
+			n_delta++;
+		} else if (zero * 10 >= total * 9) {
+			row_class[r] = ROW_DEAD;
+			map[r] = '#';
+			n_dead++;
+		} else {
+			row_class[r] = ROW_MIX;
+			map[r] = '?';
+			n_mix++;
 		}
 	}
+	map[HIMAX_MAX_TX] = 0;
+	row_counts[ROW_MIX] = n_mix; row_counts[ROW_RAW] = n_raw; row_counts[ROW_DELTA] = n_delta; row_counts[ROW_DEAD] = n_dead;
 	matrix_rest = best_rest();
+	say_both("himax: the matrix at byte %u reads %s; rows: %s (%u raw, %u delta, %u dead, %u mixed)\n",
+	    matrix_off, matrix_swapped ? "big-endian" : "little-endian", map, n_raw, n_delta, n_dead, n_mix);
+	if (!shown) {
+		shown = true;
+		if (matrix_off >= 6) {
+			printf("himax: frame at byte %u begins:", matrix_off - 6);
+			for (int i = 0; i < 6; i++) {
+				printf(" %02x", himax_rx[matrix_off - 6 + (uint32_t)i]);
+			}
+			printf("\n");
+		}
+		for (int r = 0; r < HIMAX_MAX_TX; r += 2) {
+			printf("himax: row %02d [%c]:", r, map[r]);
+			for (int c = 0; c < HIMAX_MAX_RX; c += 5) {
+				printf(" %04x", le16(himax_rx + matrix_off + 2u * ((uint32_t)r * HIMAX_MAX_RX + (uint32_t)c)));
+			}
+			printf("\n");
+		}
+	}
 }
 
 static uint32_t
@@ -1172,12 +1182,15 @@ best_rest(void)
 {
 	uint32_t inside = 0, probe = 0;
 
-	for (int r = 0; r < HIMAX_MAX_TX; r += 4) {
+	for (int r = 0; r < HIMAX_MAX_TX; r++) {
+		if (!row_class[r]) {
+			continue;
+		}
 		for (int c = 0; c < HIMAX_MAX_RX; c += 11) {
 			uint16_t v = sample_at(himax_rx + matrix_off, (uint32_t)r * HIMAX_MAX_RX + (uint32_t)c);
 
 			probe++;
-			if (matrix_raw) {
+			if (row_class[r] == ROW_RAW) {
 				if (v >= EQUILIBRIUM - 0x1000 && v <= EQUILIBRIUM + 0x1000) {
 					inside++;
 				}
@@ -1213,10 +1226,18 @@ himax_filtered(int tx, int rx)
 	 * greater than EQUILIBRIUM"); it never saw this firmware's frames, we have.
 	 */
 	value = himax_sample(tx, rx);
-	if (matrix_raw) {
+	/*
+	 * What a cell means depends on its row -- raw capacitance rests at 0x8000, deltas at zero,
+	 * and this report carries both kinds of row. Rows said to be dead or mixed answer nothing.
+	 */
+	switch (row_class[tx]) {
+	case ROW_RAW:
 		return (EQUILIBRIUM + DOWN_THRESHOLD < value) && (value < EQUILIBRIUM + UP_THRESHOLD) ? (uint16_t)(value - EQUILIBRIUM) : 0;
+	case ROW_DELTA:
+		return value < 0x2800 ? value : 0;
+	default:
+		return 0;
 	}
-	return value < 0x2800 ? value : 0;
 }
 
 /* Is there anything at all in this frame? The vendor's fast_check, shortened. */
@@ -1593,8 +1614,8 @@ himax_poll(void)
 	if (!himax_anchor()) {
 		return;                     /* an answer with no recognizable frame start changes nothing */
 	}
-	if (seen.reports == 0 || seen.reports % 512 == 511) {
-		frame_validate();
+	if (seen.reports == 0 || seen.reports % 1024 == 1023) {
+		frame_map();
 	}
 	seen.reports++;
 	for (unsigned i = 0; i < HIMAX_MAX_CONTACTS; i++) {
@@ -1873,10 +1894,12 @@ himax_thread(__unused void *parameter, __unused wait_result_t result)
 			himax_poll();
 		}
 		if (tick % (30 * (1000000 / poll_us)) == 0) {
-			say_both("himax: so far %u frames in %u looks (%u bad, %u empty answers held back, %u extra peaks merged, %u without a frame start, %u torn; anchored at byte %u as %s, %u%% at rest), %u finger positions (%u moves, the longest one drew %u), the last at %u, %u; "
+			say_both("himax: so far %u frames in %u looks (%u bad, %u empty answers held back, %u extra peaks merged, %u without a frame start, %u torn; anchored at byte %u, rows %u raw %u delta %u dead %u mixed, %u%% at rest), %u finger positions (%u moves, the longest one drew %u), the last at %u, %u; "
 			    "interrupt line %s; the line looked at every %u us\n",
 			    seen.reports, seen.polls, seen.bad, seen.stale, seen.merged,
-			    matrix_nosync, matrix_torn, matrix_off, matrix_raw ? "raw" : "delta", matrix_rest,
+			    matrix_nosync, matrix_torn, matrix_off,
+			    row_counts[1], row_counts[2], row_counts[3], row_counts[0],
+			    matrix_rest,
 			    seen.touches, seen.moves, seen.trackmax,
 			    seen.last_x, seen.last_y,
 			    gpio_get(PIN_INT) ? "high" : "low", poll_us);
