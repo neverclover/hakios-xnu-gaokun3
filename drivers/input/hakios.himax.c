@@ -1005,6 +1005,13 @@ himax_gaokun_wake(void)
 #define HIMAX_MAX_CONTACTS      5                       /* the task set: five fingers, no more */
 #define HIMAX_MAX_PEAKS         15                      /* a few candidates per finger is enough */
 #define WEAK_PEAK               800                     /* below this a peak is a fingernail: the vendor drops it */
+/*
+ * A finger that was there a moment ago does not vanish at 800: it lightens. While any finger is
+ * down the weak gate drops to this -- a line is drawn by the middle of a stroke as much as by
+ * its start, and the middle is where presses go light.
+ */
+#define KEEP_PEAK               300
+static uint32_t himax_weak_gate = WEAK_PEAK;
 
 static uint32_t
 mult_frac(uint32_t value, uint32_t multiply, uint32_t divide)
@@ -1497,7 +1504,7 @@ himax_centroid(const struct himax_peak *peak, uint32_t *sx, uint32_t *sy)
 	    vld = himax_filtered(tx + 1, rx - 1), vru = himax_filtered(tx - 1, rx + 1), vrd = himax_filtered(tx + 1, rx + 1);
 	uint32_t vsum = vl + vr + vc + vu + vd + vlu + vld + vru + vrd;
 
-	if (vc < WEAK_PEAK || vsum == 0) {
+	if (vc < himax_weak_gate || vsum == 0) {
 		return false;
 	}
 	/* the vendor's mult_frac() expanded; never negative: off-frame neighbours read zero */
@@ -1561,11 +1568,32 @@ himax_merge_peaks(struct himax_peak *peaks, unsigned *count)
  * would be.
  */
 #define MATCH_DISTANCE          (6 * 427)
+/*
+ * ...but a line does not teleport either. A move larger than this in one report -- a third of the
+ * width -- is a torn frame or a phantom blob wearing an old finger's number: it is held a frame,
+ * and it becomes real only if the next report agrees. A flick's true jump passes the witness in
+ * one extra report; a glitch never gets a second one.
+ */
+#define JUMP_LIMIT              1400
 
 static struct {
 	bool down, seen;
 	uint32_t sx, sy, x, y, dx0, dy0;
+	unsigned off;                       /* reports in a row this finger has been absent from */
+	unsigned sus;                       /* a jump too big to believe is pending: 1 = unproven, where */
+	uint32_t susx, susy;
 } contact[HIMAX_MAX_CONTACTS];
+
+static bool
+any_down(void)
+{
+	for (unsigned id = 0; id < HIMAX_MAX_CONTACTS; id++) {
+		if (contact[id].down) {
+			return true;
+		}
+	}
+	return false;
+}
 
 static void
 himax_report(unsigned count, const uint32_t *sx, const uint32_t *sy)
@@ -1608,6 +1636,28 @@ himax_report(unsigned count, const uint32_t *sx, const uint32_t *sy)
 				continue;                         /* more fingers than numbers to give them */
 			}
 		}
+		if (contact[best].down) {
+			uint32_t jx = x > contact[best].sx ? x - contact[best].sx : contact[best].sx - x;
+			uint32_t jy = y > contact[best].sy ? y - contact[best].sy : contact[best].sy - y;
+
+			if (jx + jy > JUMP_LIMIT) {
+				uint32_t px = x > contact[best].susx ? x - contact[best].susx : contact[best].susx - x;
+				uint32_t py = y > contact[best].susy ? y - contact[best].susy : contact[best].susy - y;
+
+				if (contact[best].sus == 1 && px + py <= MATCH_DISTANCE) {
+					contact[best].sus = 0;      /* the next report agrees: the jump is real */
+				} else {
+					/* unproven: the finger stays where it was proven; the jump waits a witness */
+					contact[best].sus = 1;
+					contact[best].susx = x;
+					contact[best].susy = y;
+					contact[best].seen = true;
+					continue;
+				}
+			} else {
+				contact[best].sus = 0;
+			}
+		}
 		/*
 		 * gk3.dts: touchscreen-inverted-x first, then touchscreen-swapped-x-y; its own
 		 * comment says the two do not commute, so the order is as written. Invert the
@@ -1630,9 +1680,16 @@ himax_report(unsigned count, const uint32_t *sx, const uint32_t *sy)
 		post_x = mult_frac(panel_x, 65535, PANEL_X - 1);
 		post_y = mult_frac(panel_y, 65535, PANEL_Y - 1);
 		if (!contact[best].down) {
+			static unsigned taps;      /* where presses land: the five-point calibration reads these */
+
 			contact[best].down = true;
 			contact[best].dx0 = panel_x;
 			contact[best].dy0 = panel_y;
+			contact[best].off = 0;
+			contact[best].sus = 0;
+			if (taps++ < 6) {
+				say_both("himax: tap at %u, %u (of %u x %u)\n", panel_x, panel_y, PANEL_X, PANEL_Y);
+			}
 			hakios_touch_post(HAKIOS_TOUCH_DOWN, best, post_x, post_y);
 		} else if (contact[best].x != panel_x || contact[best].y != panel_y) {
 			uint32_t run_x = panel_x > contact[best].dx0 ? panel_x - contact[best].dx0 : contact[best].dx0 - panel_x;
@@ -1647,10 +1704,24 @@ himax_report(unsigned count, const uint32_t *sx, const uint32_t *sy)
 		contact[best].x = panel_x;
 		contact[best].y = panel_y;
 	}
-	/* a finger that is no longer in the frame has lifted */
+	/*
+	 * A finger that is no longer in the frame has lifted -- but one absent report is one bad
+	 * frame, not a lift: at this rate three missed reports is half a tenth of a second, the
+	 * shortest thing a real lift looks like from here. Holding that long is what keeps a drawn
+	 * line from breaking on a single unlucky frame.
+	 */
 	for (unsigned id = 0; id < HIMAX_MAX_CONTACTS; id++) {
-		if (contact[id].down && !contact[id].seen) {
+		if (!contact[id].down) {
+			contact[id].off = 0;
+			continue;
+		}
+		if (contact[id].seen) {
+			contact[id].off = 0;
+		} else if (++contact[id].off < 3) {
+			continue;
+		} else {
 			contact[id].down = false;
+			contact[id].off = 0;
 			hakios_touch_post(HAKIOS_TOUCH_UP, id, mult_frac(contact[id].x, 65535, PANEL_X - 1),
 			    mult_frac(contact[id].y, 65535, PANEL_Y - 1));
 		}
@@ -1780,6 +1851,7 @@ himax_poll(void)
 	if (himax_any_touch()) {
 		himax_find_peaks(peaks, &peaks_count);
 		himax_merge_peaks(peaks, &peaks_count);
+		himax_weak_gate = any_down() ? KEEP_PEAK : WEAK_PEAK;
 		for (unsigned i = 0; i < peaks_count && count < HIMAX_MAX_CONTACTS; i++) {
 			if (himax_centroid(&peaks[i], &sx[count], &sy[count])) {
 				count++;
