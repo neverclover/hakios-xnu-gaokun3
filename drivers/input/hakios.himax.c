@@ -1053,17 +1053,15 @@ static uint32_t matrix_rest;
 static uint8_t row_class[HIMAX_MAX_TX];
 
 /*
- * The matrix is in five blocks of eight rows -- the panel drives eight lines at a time -- and the
- * answer pays for that: a byte of bookkeeping between blocks, which turns every other block
- * upside-down for one fixed reading place. That is what the last round's maps said without saying
- * it: raw rows in one byte order exactly delta rows in the other, eight and one and eight apart
- * -- the same quiet 0x8000, alternating phase. So each block is found on its own, drifting
- * forward by whatever the bookkeeping costs; and the byte order falls out of the alignment that
- * sees the most panel.
+ * Where every row of the matrix starts, found one row at a time. The bytes showed us the shape
+ * plainly at last: rows are honest 120-byte rows of raw capacitance at rest (0x8000, little-endian
+ * as written), and once every eight or nine rows a single byte of bookkeeping is inserted -- a
+ * gate-block boundary, whose spacing is not exactly eight. So nothing is assumed about where or
+ * how many: each row is looked for near where the last row says it must be, and whatever the
+ * answer's bookkeeping costs, the walk pays it. The byte order comes out of the walk that sees
+ * the most panel -- the bytes said little-endian; let the count agree or disagree out loud.
  */
-#define HIMAX_BLOCK_ROWS        8
-#define HIMAX_BLOCK_BYTES       (2u * HIMAX_BLOCK_ROWS * HIMAX_MAX_RX)
-static uint32_t block_byte[HIMAX_MAX_TX / HIMAX_BLOCK_ROWS];
+static uint32_t row_byte[HIMAX_MAX_TX];
 
 static uint16_t himax_sample(int tx, int rx);	/* the aligned read: used before its place of rest */
 
@@ -1074,50 +1072,47 @@ panel_ish(uint16_t v)
 }
 
 static void
-block_align(void)
+row_align(void)
 {
 	uint32_t best_total = 0;
 
 	for (int order = 0; order < 2; order++) {
-		uint32_t at[HIMAX_MAX_TX / HIMAX_BLOCK_ROWS];
+		uint32_t at[HIMAX_MAX_TX];
 		uint32_t total = 0;
-		uint32_t nominal = matrix_off;
 
-		for (unsigned b = 0; b < HIMAX_MAX_TX / HIMAX_BLOCK_ROWS; b++) {
+		for (int r = 0; r < HIMAX_MAX_TX; r++) {
+			uint32_t nominal = r == 0 ? matrix_off : at[r - 1] + 2u * HIMAX_MAX_RX;
 			uint32_t best_here = nominal, best_hits = 0;
 
-			for (int d = 0; d <= 8; d++) {
+			for (int d = 0; d <= 6; d++) {
 				uint32_t hits = 0;
 
-				for (int rr = 0; rr < HIMAX_BLOCK_ROWS; rr += 2) {
-					for (int c = 0; c < HIMAX_MAX_RX; c += 7) {
-						uint32_t addr = nominal + d + 2u * ((uint32_t)rr * HIMAX_MAX_RX + (uint32_t)c);
-						uint16_t v;
+				for (int c = 0; c < HIMAX_MAX_RX; c += 11) {
+					uint32_t addr = nominal + d + 2u * (uint32_t)c;
+					uint16_t v;
 
-						if (addr + 1 >= HIMAX_MAX_READ) {
-							continue;
-						}
-						v = le16(himax_rx + addr);
-						if (order) {
-							v = (uint16_t)((v >> 8) | (v << 8));
-						}
-						hits += panel_ish(v) != 0;
+					if (addr + 1 >= HIMAX_MAX_READ) {
+						continue;
 					}
+					v = le16(himax_rx + addr);
+					if (order) {
+						v = (uint16_t)((v >> 8) | (v << 8));
+					}
+					hits += panel_ish(v) != 0;
 				}
 				if (hits > best_hits) {
 					best_hits = hits;
 					best_here = nominal + d;
 				}
 			}
-			at[b] = best_here;
+			at[r] = best_here;
 			total += best_hits;
-			nominal = best_here + HIMAX_BLOCK_BYTES;
 		}
 		if (total > best_total) {
 			best_total = total;
 			matrix_swapped = order != 0;
-			for (unsigned b = 0; b < HIMAX_MAX_TX / HIMAX_BLOCK_ROWS; b++) {
-				block_byte[b] = at[b];
+			for (int r = 0; r < HIMAX_MAX_TX; r++) {
+				row_byte[r] = at[r];
 			}
 		}
 	}
@@ -1162,8 +1157,8 @@ himax_anchor(void)
 		return false;
 	}
 	matrix_off = head_at + 2;   /* accepted on the signature: the maps of the last rounds were built on this rule; the whole-ness check added with the blocks was an over-correction -- it refused every frame on the assumption that a report ends quiet, but after the matrix come the tx and rx arrays, panel data themselves, never quiet */
-	for (unsigned b = 0; b < HIMAX_MAX_TX / HIMAX_BLOCK_ROWS; b++) {
-		block_byte[b] = matrix_off + b * HIMAX_BLOCK_BYTES;
+	for (int r = 0; r < HIMAX_MAX_TX; r++) {
+		row_byte[r] = matrix_off + (uint32_t)r * 2u * HIMAX_MAX_RX;
 	}
 	return true;
 	}
@@ -1203,7 +1198,7 @@ frame_map(void)
 	char map[HIMAX_MAX_TX + 1];
 	uint32_t n_raw = 0, n_delta = 0, n_dead = 0, n_mix = 0;
 
-	block_align();
+	row_align();
 	frame_classify(row_class);
 	for (int r = 0; r < HIMAX_MAX_TX; r++) {
 		map[r] = row_class[r] == ROW_RAW ? 'R' : row_class[r] == ROW_DELTA ? 'D' : row_class[r] == ROW_DEAD ? '#' : '?';
@@ -1228,13 +1223,25 @@ frame_map(void)
 			agree += row_class[r] == prev_class[r];
 			prev_class[r] = row_class[r];
 		}
-		say_both("himax: reads %s; blocks at %u +%d +%d +%d +%d; rows: %s; steady %u/%u\n",
-		    matrix_swapped ? "big-endian" : "little-endian", block_byte[0],
-		    (int)(block_byte[1] - block_byte[0] - HIMAX_BLOCK_BYTES),
-		    (int)(block_byte[2] - block_byte[1] - HIMAX_BLOCK_BYTES),
-		    (int)(block_byte[3] - block_byte[2] - HIMAX_BLOCK_BYTES),
-		    (int)(block_byte[4] - block_byte[3] - HIMAX_BLOCK_BYTES),
-		    map, agree, (unsigned)HIMAX_MAX_TX);
+		{
+			/*
+			 * The drift, told one digit per row: the extra bytes this row's start carries over
+			 * the naive count. Wherever a bookkeeping byte is inserted, every later digit is one
+			 * higher -- the places it changes are the boundaries, which is the structure itself,
+			 * spelled in ten characters.
+			 */
+			char drift[HIMAX_MAX_TX + 1];
+
+			for (int r = 0; r < HIMAX_MAX_TX; r++) {
+				uint32_t naive = matrix_off + (uint32_t)r * 2u * HIMAX_MAX_RX;
+				uint32_t extra = row_byte[r] > naive ? row_byte[r] - naive : 0;
+
+				drift[r] = (char)('0' + (extra > 9 ? 9 : extra));
+			}
+			drift[HIMAX_MAX_TX] = 0;
+			say_both("himax: reads %s; rows: %s; drift: %s; steady %u/%u\n",
+			    matrix_swapped ? "big-endian" : "little-endian", map, drift, agree, (unsigned)HIMAX_MAX_TX);
+		}
 	}
 	{
 	static unsigned maps_so_far;   /* frame_map may not see `seen` -- count its own runs */
@@ -1342,8 +1349,7 @@ himax_sample(int tx, int rx)
 	if (tx < 0 || tx >= HIMAX_MAX_TX || rx < 0 || rx >= HIMAX_MAX_RX) {
 		return 0;
 	}
-	at = block_byte[tx / HIMAX_BLOCK_ROWS] +
-	    2u * ((uint32_t)(tx % HIMAX_BLOCK_ROWS) * HIMAX_MAX_RX + (uint32_t)rx);
+	at = row_byte[tx] + 2u * (uint32_t)rx;
 	if (at + 1 >= HIMAX_MAX_READ) {
 		return 0;
 	}
