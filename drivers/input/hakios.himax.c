@@ -1088,7 +1088,13 @@ matrix_look(const uint8_t *answer, uint32_t length)
 	uint32_t best = 0, best_at = 0;
 	bool best_swap = false, best_raw = true;
 
-	for (uint32_t off = 0; off + 2u * HIMAX_MAX_TX * HIMAX_MAX_RX <= length; off += 2) {
+	/*
+	 * Step one byte, not two: a 57% best (about half the probes at rest, half not) is the shape of
+	 * a 16-bit matrix read one byte off -- every word then straddles two real words, half of them
+	 * landing at the equilibrium by accident. Trying only even starts could never find such a frame.
+	 * It costs a little time and answers the alignment question outright.
+	 */
+	for (uint32_t off = 0; off + 2u * HIMAX_MAX_TX * HIMAX_MAX_RX <= length; off += 1) {
 		for (int swap = 0; swap < 2; swap++) {
 			for (int raw = 0; raw < 2; raw++) {
 				uint32_t inside = count_rest(answer, off, swap != 0, raw != 0);
