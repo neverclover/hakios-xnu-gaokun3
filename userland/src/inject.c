@@ -672,6 +672,35 @@ set_minimum_floor(id self, SEL selector, double level, double fade)
 	original_set_minimum(self, selector, level, fade);
 }
 
+/*
+ * The names of the backlight machinery, from the class itself. Two rounds of replacing by the
+ * sound of a log line missed: the floor method is not called what the log says. So ask the
+ * class -- every method name of the backlight control and of the brightness system, once, in
+ * the log. The next round replaces the real ones, not the guessed ones.
+ */
+__attribute__((unused)) static void
+list_backlight_methods(void)
+{
+	static const char *const wanted[] = { "BLControl", "BrightnessSystem" };
+
+	for (unsigned c = 0; c < sizeof(wanted) / sizeof(wanted[0]); c++) {
+		Class cls = objc_getClass(wanted[c]);
+		unsigned count = 0;
+		Method *methods = cls ? class_copyMethodList(cls, &count) : NULL;
+
+		if (methods == NULL) {
+			say("hakios: %s: no method list\n", wanted[c]);
+			continue;
+		}
+		say("hakios: %s: %u methods: ", wanted[c], count);
+		for (unsigned i = 0; i < count; i++) {
+			say("%s ", sel_getName(method_getName(methods[i])));
+		}
+		say("\n");
+		free(methods);
+	}
+}
+
 __attribute__((unused)) static void
 brightness_floor(void)
 {
@@ -1226,6 +1255,7 @@ hakios_init(void)
 		    ^{ keep_lit(); });
 		idle_sleep_fixes();		/* and the sleep that dims: its interval is answered elsewhere */
 		brightness_floor();		/* ... and its floor is raised where the interval answer missed */
+		list_backlight_methods();	/* ... and what the next round will replace are the class's own names */
 
 		/*
 		 * Boot-arg ca_vbl=1: CoreAnimation's frame clock from the display driver's refresh

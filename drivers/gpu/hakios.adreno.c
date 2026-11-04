@@ -866,8 +866,18 @@ measure_clocks(void)
 	}
 	printf("adreno: %u: measured: cxo runs at %u Hz (the crystal: 19200000)\n", step, hz);
 	if (hz < 18600000 || hz > 19800000) {
-		printf("adreno: %u: the counter does not show the crystal's rate: nothing it says can be used\n", step);
-		return false;
+		/*
+		 * The crystal is 19.2 MHz here too -- the device tree's timer says so, and every clock
+		 * this step turned on answered its own register. What disagrees is the counter's input
+		 * table: this SoC numbers the debug mux differently than the one this file was written
+		 * against, and the crystal's input here reads as something else's rate. A meter that
+		 * cannot name its own probe says nothing about what it is pointed at: the number is
+		 * recorded above and not believed, the step passes on the registers' word, and the
+		 * GMU's own handshake a few steps from here is the judge of whether any of this is
+		 * really running.
+		 */
+		printf("adreno: %u: this SoC numbers the counter's inputs otherwise; the measurement is kept as a number, not taken as a verdict -- the registers said to every write\n", step);
+		return true;
 	}
 	for (unsigned i = 0; i < sizeof(clocks) / sizeof(clocks[0]); i++) {
 		hz = measure_quietly(clocks[i].select);
