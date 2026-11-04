@@ -1709,25 +1709,52 @@ zap_header(uint64_t *phys)
 	if (header == NULL) {
 		return false;
 	}
-	/* a 32-bit ELF: the count of segments at 44, the table of them at 52, 32 bytes each, the file size of one at +16 */
-	segments = size >= 52 + 2 * 32 ? header[44] | header[45] << 8 : 0;
-	if (memcmp(header, "\177ELF\1", 5) != 0 || segments < 2 || size > PAGE_SIZE) {
-		printf("adreno: %u: that is not such a header (%02x %02x %02x %02x, %u segments)\n", step, header[0], header[1],
-		    header[2], header[3], segments);
+	/*
+	 * A 32-bit little-endian ELF, exactly as the vendor signs it for this card. The table of
+	 * program headers sits where the header points (e_phoff), 32 bytes each. The loadable ones
+	 * (type 1) carry the shader itself -- later calls deal with those. What TrustZone signs is
+	 * everything up to and including the last not-loadable segment: the header, its table, and
+	 * the block of hashes. Read the card's own table to find where that ends -- do not assume
+	 * the hashes sit flush against the header: this card keeps them at an offset of their own
+	 * and the code behind them, and that is the whole difference from the phone's split .mdt.
+	 */
+	uint32_t phoff, phentsize;
+	uint64_t meta_end;
+
+	phentsize = header[42] | header[43] << 8;
+	segments = header[44] | header[45] << 8;
+	phoff = header[28] | header[29] << 8 | header[30] << 16 | (uint32_t)header[31] << 24;
+	if (memcmp(header, "\177ELF\1", 5) != 0 || segments < 2 || phentsize != 32 ||
+	    (uint64_t)phoff + (uint64_t)segments * 32 > size) {
+		printf("adreno: %u: that is not such a header (%02x %02x %02x %02x, %u segments of %u)\n", step, header[0],
+		    header[1], header[2], header[3], segments, phentsize);
 		return false;
 	}
-	memcpy(&hashes, header + 52 + 32 + 16, sizeof(hashes));
-	printf("adreno: %u: an ELF header of %u segments, %u bytes with its table, then %llu bytes; by the table, %u of hashes\n",
-	    step, segments, 52 + 32 * segments, size - (52 + 32 * segments), hashes);
-	if (52 + 32 * segments + (uint64_t)hashes != size) {
-		printf("adreno: %u: the file is not the header followed by the hashes alone: not what TrustZone takes\n", step);
+	meta_end = (uint64_t)phoff + (uint64_t)segments * 32;
+	for (unsigned which = 0; which < segments; which++) {
+		const uint8_t *ph = header + phoff + which * 32;
+		uint32_t type = ph[0] | ph[1] << 8 | ph[2] << 16 | (uint32_t)ph[3] << 24;
+		uint32_t off = ph[4] | ph[5] << 8 | ph[6] << 16 | (uint32_t)ph[7] << 24;
+		uint32_t filesz = ph[16] | ph[17] << 8 | ph[18] << 16 | (uint32_t)ph[19] << 24;
+
+		if (type == 4) {
+			hashes = filesz;                                   /* a named note block, if any */
+		}
+		if (type != 1 && (uint64_t)off + filesz > meta_end) { /* not loadable: signature material */
+			meta_end = (uint64_t)off + filesz;
+		}
+	}
+	printf("adreno: %u: an ELF header of %u segments, its table at %u; the signed material runs to byte %llu of %llu, %u of notes\n",
+	    step, segments, phoff, meta_end, size, hashes);
+	if (meta_end > PAGE_SIZE) {
+		printf("adreno: %u: the signed material is more than a page: not what this driver can hand over\n", step);
 		return false;
 	}
 	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 		printf("adreno: %u: no memory\n", step);
 		return false;
 	}
-	memcpy((void *)page, header, size);
+	memcpy((void *)page, header, meta_end);   /* the signed material, not the code that comes after it */
 	to_memory(page, PAGE_SIZE);             /* TrustZone reads memory, not this processor's cache */
 	*phys = kvtophys(page);
 	return true;

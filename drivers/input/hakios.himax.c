@@ -2179,12 +2179,12 @@ himax_thread(__unused void *parameter, __unused wait_result_t result)
 					unsigned at = 0;
 
 					for (unsigned r = seg * 10u; r < seg * 10u + 10u && r < HIMAX_MAX_TX; r++) {
-						uint32_t h = row_hist[r] / 100u;
+						uint32_t h = row_hist[r];   /* counts here are small: a /100 read them all as zero */
 
 						hist[at++] = (char)('0' + (h > 9 ? 9 : h));
 					}
 					hist[at] = 0;
-					say_both("himax: peaks per matrix row x100: %s\n", hist);
+					say_both("himax: peaks per matrix row (9 caps a line): %s\n", hist);
 				}
 			}
 			say_both("himax: so far %u frames in %u looks (%u bad, %u empty answers held back, %u extra peaks merged, %u without a frame start, %u torn; anchored at byte %u, rows %u raw %u delta %u dead %u mixed, %u%% at rest), %u finger positions (%u moves, the longest one drew %u), the last at %u, %u; "
