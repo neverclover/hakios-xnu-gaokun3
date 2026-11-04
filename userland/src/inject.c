@@ -1094,6 +1094,31 @@ hakios_init(void)
 		size_t size = sizeof(arguments) - 1;
 
 		/*
+		 * Auto-brightness, on a machine with no light sensor. The userland asks the sensor at
+		 * startup, gets its timeout (the log says so: "timeout waiting for ALS arrival"), and
+		 * carries on with the one curve it has: an absent sensor reads as a dark room, and the
+		 * floor of that curve is zero. So every idle fade lands the screen at true black and no
+		 * wake lifts it again -- the wake asks the same curve and gets the same zero. Here there
+		 * is nothing to measure and no light to adapt to: turn the adaptation off and set the
+		 * level once, the way a person would at Settings / Accessibility / Display. Both names
+		 * are looked for, not assumed (BackBoardServices.tbd, iOS 16.5, lists them).
+		 */
+		{
+			void (*auto_off)(bool) = dlsym(RTLD_DEFAULT, "BKSDisplayBrightnessSetAutoBrightnessEnabled");
+			void (*set_level)(double) = dlsym(RTLD_DEFAULT, "BKSDisplayBrightnessSet");
+
+			if (auto_off != NULL) {
+				auto_off(false);
+				say("hakios: the light sensor this machine has is none; auto-brightness is off\n");
+			} else {
+				say("hakios: BKSDisplayBrightnessSetAutoBrightnessEnabled: not this userland's name; left\n");
+			}
+			if (auto_off != NULL && set_level != NULL) {
+				set_level(0.5);   /* the level the machine itself asked for at startup */
+			}
+		}
+
+		/*
 		 * Boot-arg ca_vbl=1: CoreAnimation's frame clock from the display driver's refresh
 		 * notifications. QuartzCore takes them (IOMobileFramebufferEnableVSyncNotifications) only on
 		 * the phones with an A7 to A10, or when CA_FORCE_TIMER is in the environment

@@ -2692,8 +2692,16 @@ step_zap_load(void)
 	announce("ask TrustZone to give up a zap shader that a kernel before this one may have left");
 	printf("adreno: %u: %s\n", step, zap_unload() ? "TrustZone has given up what it had (it says so with none, too)" :
 	    "TRUSTZONE DOES NOT GIVE IT UP: the next answers tell whether it keeps one");
-	segment = image_file("fw", "qcdxkmsuc8280.b02", &size);	/* the signed image of this card is one .mbn; its small hash segment, if the vendor ever splits one, would be this name -- until then this step says so plainly */
+	segment = image_file("fw", "qcdxkmsuc8280.b02", &size);
 	if (segment == NULL || size == 0 || size > 0x1000) {
+		/*
+		 * The phone's signed shader came split: a header file and small hash segments. This
+		 * machine's vendor ships one legacy .mbn -- the segment table is inside the image, not
+		 * beside it. The steps before this one have run and are registered; reading this
+		 * image's own table is the next piece of work, and stopping here says so plainly.
+		 */
+		printf("adreno: %u: this card's shader is a single signed .mbn: no separate hash segment "
+		    "to hand TrustZone -- the image's own segment table is what would have to be read; not done yet\n", step);
 		return false;
 	}
 	announce("hand the zap shader's header to TrustZone, tell it where the image goes, put the image there, and ask "
@@ -3768,7 +3776,7 @@ extern vm_offset_t pe_arm_get_soc_base_phys(void);
 static bool
 start_by_itself(void)
 {
-	static const char *const files[] = { "a660_gmu.bin", "a660_sqe.fw", "qcdxkmsuc8280.mbn", "qcdxkmsuc8280.b02" };
+	static const char *const files[] = { "a660_gmu.bin", "a660_sqe.fw", "qcdxkmsuc8280.mbn" };
 	const char *missing = NULL;
 	uint64_t size;
 
