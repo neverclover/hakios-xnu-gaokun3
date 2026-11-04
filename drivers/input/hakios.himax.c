@@ -2194,8 +2194,8 @@ himax_thread(__unused void *parameter, __unused wait_result_t result)
 			    row_counts[1], row_counts[2], row_counts[3], row_counts[0],
 			    matrix_rest,
 			    seen.touches, seen.moves, seen.trackmax,
-			    seen.last_x, seen.last_y, peak_max, peak_hist[0], peak_hist[1], peak_hist[2], peak_hist[3],
-			    gpio_get(PIN_INT) ? "high" : "low", poll_us);
+			    seen.last_x, seen.last_y, gpio_get(PIN_INT) ? "high" : "low", poll_us,
+			peak_max, peak_hist[0], peak_hist[1], peak_hist[2], peak_hist[3]);
 			say_evidence();
 		}
 		sleep_us(poll_us);
