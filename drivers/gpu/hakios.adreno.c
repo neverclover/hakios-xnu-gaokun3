@@ -2692,7 +2692,7 @@ step_zap_load(void)
 	announce("ask TrustZone to give up a zap shader that a kernel before this one may have left");
 	printf("adreno: %u: %s\n", step, zap_unload() ? "TrustZone has given up what it had (it says so with none, too)" :
 	    "TRUSTZONE DOES NOT GIVE IT UP: the next answers tell whether it keeps one");
-	segment = image_file("fw", "a660_zap.b02", &size);
+	segment = image_file("fw", "qcdxkmsuc8280.b02", &size);	/* the signed image of this card is one .mbn; its small hash segment, if the vendor ever splits one, would be this name -- until then this step says so plainly */
 	if (segment == NULL || size == 0 || size > 0x1000) {
 		return false;
 	}
@@ -3768,7 +3768,7 @@ extern vm_offset_t pe_arm_get_soc_base_phys(void);
 static bool
 start_by_itself(void)
 {
-	static const char *const files[] = { "a660_gmu.bin", "a660_sqe.fw", "a660_zap.mdt", "a660_zap.b02" };
+	static const char *const files[] = { "a660_gmu.bin", "a660_sqe.fw", "qcdxkmsuc8280.mbn", "qcdxkmsuc8280.b02" };
 	const char *missing = NULL;
 	uint64_t size;
 

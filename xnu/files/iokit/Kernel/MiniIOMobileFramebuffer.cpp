@@ -85,7 +85,10 @@ enum {
 
 #define FOURCC(a, b, c, d) ((uint32_t)(a) << 24 | (uint32_t)(b) << 16 | (uint32_t)(c) << 8 | (uint32_t)(d))
 
-static uint64_t gFBLogged[2];           /* selectors already reported */
+static uint64_t gFBLogged[2];
+static unsigned char gFBSavedAttrs[4096];   /* the display attributes as they were last set */
+static unsigned long gFBSavedAttrsLen;
+static uint64_t gFBDisplayPower = 1;       /* the panel is up when the loader hands it over */           /* selectors already reported */
 static uint8_t  gFBCalls[128];          /* how many calls of each selector were traced */
 
 /*
@@ -1636,6 +1639,44 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		}
 		out[0] = mach_absolute_time();
 		args->scalarOutputCount = 1;
+		return kIOReturnSuccess;
+
+	case 17:
+		/*
+		 * The wake path of the display: the window server writes the attributes of the mode it
+		 * wants (a 3084-byte structure in) and reads them back before it drives anything. A
+		 * reader that answers zeros told it there is no display -- the screen stayed dark after
+		 * an idle sleep. So keep what was given, and answer reads with exactly that.
+		 */
+		if (args->structureInput != NULL && args->structureInputSize != 0 &&
+		    args->structureInputSize <= sizeof(gFBSavedAttrs)) {
+			memcpy(gFBSavedAttrs, args->structureInput, args->structureInputSize);
+			gFBSavedAttrsLen = args->structureInputSize;
+		}
+		return kIOReturnSuccess;
+
+	case 27:
+		if (args->structureOutput != NULL && args->structureOutputSize != 0) {
+			unsigned long n = args->structureOutputSize;
+
+			if (n > gFBSavedAttrsLen) {
+				n = gFBSavedAttrsLen;
+			}
+			bzero(args->structureOutput, args->structureOutputSize);
+			if (n != 0) {
+				memcpy(args->structureOutput, gFBSavedAttrs, n);
+			}
+		}
+		return kIOReturnSuccess;
+
+	case 50:
+		/* the display's power, said plainly and kept: off(0)/on(1) by the shape of the calls */
+		if (args->scalarInputCount >= 1) {
+			if (gFBDisplayPower != in[0]) {
+				gFBDisplayPower = in[0];
+				IOLog("MiniIOMobileFramebuffer: display power is now 0x%llx\n", in[0]);
+			}
+		}
 		return kIOReturnSuccess;
 
 	default:
