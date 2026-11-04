@@ -995,8 +995,15 @@ himax_gaokun_wake(void)
 
 /* The vendor's thresholds: a finger lifts a sample above the equilibrium; anything else is noise. */
 #define EQUILIBRIUM             0x8000
-#define DOWN_THRESHOLD          0x100
-#define UP_THRESHOLD            0x1000
+/*
+ * The window above the rest a cell must sit in to be believed at all. Rest noise measured from
+ * this firmware's quiet frames: about +-0x30. The floor of 0x100 was a guess from the phone
+ * days, and it eats light presses whole -- "not sensitive" starts here, not in the sensor. The
+ * floor goes to twice the measured noise; the ceiling to the whole sane range, because a strong
+ * press past 0x1000 used to read as nothing at all.
+ */
+#define DOWN_THRESHOLD          0x060
+#define UP_THRESHOLD            0x3000
 
 /* The frame's extent in the sensor's own coordinates, and the vendor's scaling factors. */
 /*
@@ -1529,6 +1536,10 @@ himax_centroid(const struct himax_peak *peak, uint32_t *sx, uint32_t *sy)
 	return true;
 }
 
+static uint32_t row_hist[HIMAX_MAX_TX];	/* peaks per matrix row, since boot: which lines of the panel answer at all */
+static uint32_t peak_hist[4];			/* the strongest cell of each frame, in bands: how high presses actually reach */
+static uint32_t peak_max;
+
 /* What has been seen so far: said once a minute, so that the end of the log always tells. */
 static struct {
 	uint32_t polls, reports, touches, bad, last_x, last_y, moves, trackmax, stale, merged, moff;
@@ -1870,6 +1881,27 @@ himax_poll(void)
 		himax_find_peaks(peaks, &peaks_count);
 		himax_merge_peaks(peaks, &peaks_count);
 		himax_weak_gate = any_down() ? KEEP_PEAK : WEAK_PEAK;
+		/*
+		 * A census, not a guess: every peak that survives the merge says which row it stands
+		 * on and how tall it is. The row tally answers "does the right of the panel send at
+		 * all" -- no tuning can invent what the sensor does not report. The height tally
+		 * answers "how soft is a press really" -- that is where the thresholds must be set,
+		 * by the presses themselves and not by the phone's old numbers.
+		 */
+		for (unsigned i = 0; i < peaks_count; i++) {
+			if (peaks[i].y < HIMAX_MAX_TX) {
+				row_hist[peaks[i].y]++;
+			}
+			{
+				uint16_t v = himax_filtered(peaks[i].y, peaks[i].x);
+				uint32_t which = v >= 4000 ? 3 : v >= 1500 ? 2 : v >= 600 ? 1 : 0;
+
+				if (v > peak_max) {
+					peak_max = v;
+				}
+				peak_hist[which]++;
+			}
+		}
 		for (unsigned i = 0; i < peaks_count && count < HIMAX_MAX_CONTACTS; i++) {
 			if (himax_centroid(&peaks[i], &sx[count], &sy[count])) {
 				count++;
@@ -2140,14 +2172,29 @@ himax_thread(__unused void *parameter, __unused wait_result_t result)
 			himax_poll();
 		}
 		if (tick % (30 * (1000000 / poll_us)) == 0) {
+			{
+				char hist[64];
+
+				for (unsigned seg = 0; seg < 6; seg++) {
+					unsigned at = 0;
+
+					for (unsigned r = seg * 10u; r < seg * 10u + 10u && r < HIMAX_MAX_TX; r++) {
+						uint32_t h = row_hist[r] / 100u;
+
+						hist[at++] = (char)('0' + (h > 9 ? 9 : h));
+					}
+					hist[at] = 0;
+					say_both("himax: peaks per matrix row x100: %s\n", hist);
+				}
+			}
 			say_both("himax: so far %u frames in %u looks (%u bad, %u empty answers held back, %u extra peaks merged, %u without a frame start, %u torn; anchored at byte %u, rows %u raw %u delta %u dead %u mixed, %u%% at rest), %u finger positions (%u moves, the longest one drew %u), the last at %u, %u; "
-			    "interrupt line %s; the line looked at every %u us\n",
+			    "interrupt line %s; the line looked at every %u us; the loudest cell ever %u, strengths: %u under 600, %u 600-1500, %u 1500-4000, %u over\n",
 			    seen.reports, seen.polls, seen.bad, seen.stale, seen.merged,
 			    matrix_nosync, matrix_torn, matrix_off,
 			    row_counts[1], row_counts[2], row_counts[3], row_counts[0],
 			    matrix_rest,
 			    seen.touches, seen.moves, seen.trackmax,
-			    seen.last_x, seen.last_y,
+			    seen.last_x, seen.last_y, peak_max, peak_hist[0], peak_hist[1], peak_hist[2], peak_hist[3],
 			    gpio_get(PIN_INT) ? "high" : "low", poll_us);
 			say_evidence();
 		}
