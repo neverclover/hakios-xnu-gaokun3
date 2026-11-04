@@ -1022,11 +1022,19 @@ mult_frac(uint32_t value, uint32_t multiply, uint32_t divide)
  * at: the place and byte order where the most samples sit at the panel's equilibrium is the
  * matrix, and that is where the next 128 frames are read.
  */
-static uint32_t matrix_off = HIMAX_FRAME_OFF;    /* the old fixed assumption, until looking says better */
-static bool matrix_swapped;
-static bool matrix_raw = true;                   /* raw capacitance (at rest 0x8000) or deltas (at rest 0)? the frame says */
-static uint32_t matrix_rest;                     /* percent of probe samples inside the chosen model's rest band */
-static uint32_t matrix_falls;                    /* times looking found nothing to believe */
+/*
+ * Where the matrix is: asked of the frame itself, every frame. The answer's own first words are
+ * `00 00 5a 5a` -- the sync this firmware puts before every report -- and the matrix begins four
+ * bytes into the answer, that is, two bytes after the sync. The count of bus echo bytes before
+ * the answer starts varies (two one time, three the next), and a panel at rest in deltas rests
+ * the same everywhere, so last round's statistical search for the matrix slid up into the header
+ * -- which is how a still panel began pressing keys by itself. The sync is not rest data and it
+ * does not move. Anchor on it, per frame.
+ */
+static uint32_t matrix_off;                    /* every frame says where; nothing assumed */
+static bool matrix_swapped;                    /* decided once at the anchor, both orders counted */
+static uint32_t matrix_rest;                   /* percent of probe samples at their rest there */
+static uint32_t matrix_nosync;                 /* answers with no recognizable frame start */
 
 static uint16_t
 sample_at(const uint8_t *base, uint32_t word)
@@ -1036,93 +1044,56 @@ sample_at(const uint8_t *base, uint32_t word)
 	return matrix_swapped ? (uint16_t)((v >> 8) | (v << 8)) : v;
 }
 
+static bool
+himax_anchor(void)
+{
+	for (uint32_t i = 0; i < 32 && i + 2u * (HIMAX_MAX_TX * HIMAX_MAX_RX) <= HIMAX_MAX_READ; i++) {
+		if (himax_rx[i] == 0x5a && himax_rx[i + 1] == 0x5a) {
+			matrix_off = i + 2;
+			return true;
+		}
+	}
+	matrix_nosync++;
+	return false;
+}
+
 /*
- * Where the matrix is, and what kind of numbers it holds. The answers of this firmware turned out
- * to have neither a fixed prefix nor -- as the first looking found -- a sea of 0x8000 anywhere in
- * them: at the best place and order only half of the samples sat at the raw equilibrium. The
- * vendor's stack sizes hint at why: the answer carries the matrix and more arrays besides, and
- * this RawOut mode is known to mix per-channel changes in with the raw cells. So the frame is
- * asked two questions at once -- at which byte, and in which order, do the samples look most like
- * a panel at rest; and which rest does it keep: the raw equilibrium around 0x8000, or the quiet
- * zero of deltas? The model with the more believing samples is the one read.
+ * What sits at the anchor, in which byte order: counted once and kept, not per frame -- a model
+ * that changes with the luck of one quiet frame was last round's mistake. Both orders are
+ * counted; the one that finds more of the frame at rest is the order the frame is written in.
  */
-static bool
-rest_raw(uint16_t v)
-{
-	return v >= EQUILIBRIUM - 0x1000 && v <= EQUILIBRIUM + 0x1000;
-}
-
-static bool
-rest_delta(uint16_t v)
-{
-	return v < 0x2800 || v >= 0xD800;            /* small positive, or a small negative in two's complement */
-}
-
-static uint32_t
-count_rest(const uint8_t *answer, uint32_t off, bool swap, bool raw)
-{
-	uint32_t inside = 0;
-
-	/* probe 96 cells spread over twenty rows of the matrix -- enough to weigh a model, cheap enough
-	   to weigh many */
-	for (int r = 0; r < 20; r += 2) {
-		for (int c = 0; c < 60; c += 6) {
-			uint16_t v = le16(answer + off + 2u * ((uint32_t)r * HIMAX_MAX_RX + (uint32_t)c));
-
-			if (swap) {
-				v = (uint16_t)((v >> 8) | (v << 8));
-			}
-			if (raw ? rest_raw(v) : rest_delta(v)) {
-				inside++;
-			}
-		}
-	}
-	return inside;
-}
-
-#define PROBES          (20 / 2 * (60 / 6))
-
 static void
-matrix_look(const uint8_t *answer, uint32_t length)
+frame_validate(void)
 {
-	uint32_t best = 0, best_at = 0;
-	bool best_swap = false, best_raw = true;
+	static bool decided;
+	uint32_t ok[2] = { 0, 0 }, probe = 0;
 
-	/*
-	 * Step one byte, not two: a 57% best (about half the probes at rest, half not) is the shape of
-	 * a 16-bit matrix read one byte off -- every word then straddles two real words, half of them
-	 * landing at the equilibrium by accident. Trying only even starts could never find such a frame.
-	 * It costs a little time and answers the alignment question outright.
-	 */
-	for (uint32_t off = 0; off + 2u * HIMAX_MAX_TX * HIMAX_MAX_RX <= length; off += 1) {
-		for (int swap = 0; swap < 2; swap++) {
-			for (int raw = 0; raw < 2; raw++) {
-				uint32_t inside = count_rest(answer, off, swap != 0, raw != 0);
+	for (int swap = 0; swap < 2; swap++) {
+		for (int r = 0; r < HIMAX_MAX_TX; r += 4) {
+			for (int c = 0; c < HIMAX_MAX_RX; c += 11) {
+				uint16_t v = le16(himax_rx + matrix_off + 2u * ((uint32_t)r * HIMAX_MAX_RX + (uint32_t)c));
 
-				if (inside > best) {
-					best = inside;
-					best_at = off;
-					best_swap = swap != 0;
-					best_raw = raw != 0;
+				if (swap) {
+					v = (uint16_t)((v >> 8) | (v << 8));
 				}
+				if (v < 0x2800 || v >= 0xD800) {      /* a delta frame's rest: small around zero */
+					ok[swap]++;
+				}
+				probe++;
 			}
 		}
 	}
-	if (best < PROBES / 3) {
-		matrix_falls++;
-		say_both("himax: no matrix found anywhere in the answer (%u/%u samples at any rest); reading on at byte %u\n",
-		    best, (unsigned)PROBES, matrix_off);
-		return;
+	if (!decided) {
+		decided = true;
+		matrix_swapped = ok[1] > ok[0];
+		say_both("himax: the anchored matrix reads %s: %u/%u probe cells sit at their rest\n",
+		    matrix_swapped ? "big-endian" : "little-endian", ok[1] > ok[0] ? ok[1] : ok[0], probe);
 	}
-	if (best_at != matrix_off || best_swap != matrix_swapped || best_raw != matrix_raw) {
-		say_both("himax: the matrix is at byte %u of the answer%s, as %s: %u%% of it sits at its rest\n",
-		    best_at, best_swap ? " (big-endian words)" : "",
-		    best_raw ? "raw capacitance (rest 0x8000)" : "deltas (rest zero)", best * 100 / PROBES);
+	{
+		uint32_t better = ok[1] > ok[0] ? ok[1] : ok[0];
+
+		matrix_rest = probe ? better * 100 / probe : 0;
 	}
-	matrix_off = best_at;
-	matrix_swapped = best_swap;
-	matrix_raw = best_raw;
-	matrix_rest = best * 100 / PROBES;
 }
 
 static uint16_t
@@ -1131,7 +1102,7 @@ himax_sample(int tx, int rx)
 	return sample_at(himax_rx + matrix_off, (uint32_t)tx * HIMAX_MAX_RX + (uint32_t)rx);
 }
 
-/* Inside the frame and a real finger: the value above equilibrium, else 0 (the vendor's simple_filter). */
+/* Inside the frame and a real finger: the deflection above rest, else 0. */
 static uint16_t
 himax_filtered(int tx, int rx)
 {
@@ -1140,13 +1111,16 @@ himax_filtered(int tx, int rx)
 	if (tx < 0 || tx >= HIMAX_MAX_TX || rx < 0 || rx >= HIMAX_MAX_RX) {
 		return 0;
 	}
+	/*
+	 * A delta frame: at rest small numbers around zero; a finger a positive change of hundreds
+	 * to a few thousand. High unsigneds are drift and dead channels, not touch. This is what
+	 * the hardware said, against the vendor file's assumed 0x8000 equilibrium -- no position or
+	 * byte order ever found a sea at 0x8000, while the whole frame rests around zero. The
+	 * comment in that file says as much where it guesses ("the touched area seems to only be
+	 * greater than EQUILIBRIUM"); it never saw this firmware's frames, we have.
+	 */
 	value = himax_sample(tx, rx);
-	if (!matrix_raw) {
-		/* a delta frame: at rest zero, a finger a positive change; small negatives (two's complement
-		 * high) are noise, big negatives are dead channels */
-		return value < 0x2800 ? value : 0;
-	}
-	return (EQUILIBRIUM + DOWN_THRESHOLD < value) && (value < EQUILIBRIUM + UP_THRESHOLD) ? (uint16_t)(value - EQUILIBRIUM) : 0;
+	return value < 0x2800 ? value : 0;
 }
 
 /* Is there anything at all in this frame? The vendor's fast_check, shortened. */
@@ -1466,18 +1440,7 @@ himax_forensics(void)
 	 * reads at the equilibrium, 0x8000-ish everywhere. The first is "there was nothing to read"
 	 * -- not "the finger lifted" -- and the difference is everything to a drawn line.
 	 */
-	if (!(hi != 0 || lo != 0)) {
-		return false;
-	}
-	{
-		static unsigned since_look = 128;   /* ask the very first real frame where it is */
-
-		if (since_look++ >= 128) {
-			since_look = 0;
-			matrix_look(himax_rx, HIMAX_BUS_R_HLEN + HIMAX_REPORT_BYTES);
-		}
-	}
-	return true;
+	return hi != 0 || lo != 0;
 }
 
 /* Burst-read the frame and turn its peaks into fingers. */
@@ -1529,6 +1492,12 @@ himax_poll(void)
 	if (!himax_forensics()) {
 		seen.stale++;                 /* nothing was there to read: hold every finger as it is */
 		return;
+	}
+	if (!himax_anchor()) {
+		return;                     /* an answer with no recognizable frame start changes nothing */
+	}
+	if (seen.reports == 0 || seen.reports % 512 == 511) {
+		frame_validate();
 	}
 	seen.reports++;
 	for (unsigned i = 0; i < HIMAX_MAX_CONTACTS; i++) {
@@ -1807,10 +1776,10 @@ himax_thread(__unused void *parameter, __unused wait_result_t result)
 			himax_poll();
 		}
 		if (tick % (30 * (1000000 / poll_us)) == 0) {
-			say_both("himax: so far %u frames in %u looks (%u bad, %u empty answers held back, %u extra peaks merged; matrix at byte %u as %s, %u%% at rest), %u finger positions (%u moves, the longest one drew %u), the last at %u, %u; "
+			say_both("himax: so far %u frames in %u looks (%u bad, %u empty answers held back, %u extra peaks merged, %u without a frame start; anchored at byte %u, %u%% at rest), %u finger positions (%u moves, the longest one drew %u), the last at %u, %u; "
 			    "interrupt line %s; the line looked at every %u us\n",
 			    seen.reports, seen.polls, seen.bad, seen.stale, seen.merged,
-			    matrix_off, matrix_raw ? "raw" : "delta", matrix_rest,
+			    matrix_nosync, matrix_off, matrix_rest,
 			    seen.touches, seen.moves, seen.trackmax,
 			    seen.last_x, seen.last_y,
 			    gpio_get(PIN_INT) ? "high" : "low", poll_us);
