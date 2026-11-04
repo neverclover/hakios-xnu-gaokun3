@@ -1143,7 +1143,7 @@ himax_centroid(const struct himax_peak *peak, uint32_t *sx, uint32_t *sy)
 
 /* What has been seen so far: said once a minute, so that the end of the log always tells. */
 static struct {
-	uint32_t polls, reports, touches, bad, last_x, last_y, moves, trackmax, stale;
+	uint32_t polls, reports, touches, bad, last_x, last_y, moves, trackmax, stale, merged;
 	uint32_t smin, smax;                  /* the sample values over all frames: an untouched panel rests at 0x8000 */
 	uint32_t types[4];                  /* how the stack's first data byte reads: the types the vendor names, and others */
 	uint32_t excited;                   /* frames where the range says something moved */
@@ -1152,12 +1152,50 @@ static struct {
 } seen;
 
 /*
+ * One finger that is drawing a line presses flat, and its pressure spreads over two or three
+ * cells: with the dedup's three-channel limit, peaks a little farther apart both survive, the
+ * frame reports one hand as two fingers, and the centroid of each frame alternates between
+ * them -- which is exactly the "jumps between two channels, especially when the contact area
+ * is enlarged" the vendor's own comment warns a drawn line into. Peaks within this many
+ * channels of a stronger one belong to one blob: the strong one keeps the name, the weak one
+ * is absorbed. Fingers held side by side sit about nine or more apart; a blob does not.
+ */
+#define BLOB_DISTANCE           7
+
+static void
+himax_merge_peaks(struct himax_peak *peaks, unsigned *count)
+{
+	for (unsigned i = 0; i < *count; i++) {
+		for (unsigned j = i + 1; j < *count;) {
+			int dx = peaks[i].x - peaks[j].x, dy = peaks[i].y - peaks[j].y;
+
+			if ((dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy) <= BLOB_DISTANCE) {
+				*count -= 1;
+				for (unsigned k = j; k < *count; k++) {
+					peaks[k] = peaks[k + 1];
+				}
+				seen.merged++;
+			} else {
+				j++;
+			}
+		}
+	}
+}
+
+
+/*
  * Which fingers were in the last frame, and where. The frame carries peaks, not numbers, so a
  * finger keeps its number by sitting near where that number was last frame: one channel of the
  * grid is about 427 sensor units in x and 400 in y, and a finger does not jump three channels
  * between reports 8 ms apart. The bookkeeping itself is the phone driver's.
  */
-#define MATCH_DISTANCE          (3 * 427)
+/*
+ * A finger does not jump. But two channels of alternation along a diagonal is 2*427 + 2*400
+ * of distance, and three was this driver's old limit -- the drawn line slipped past it and
+ * re-began itself. Six channels of either axis is still far short of where a second finger
+ * would be.
+ */
+#define MATCH_DISTANCE          (6 * 427)
 
 static struct {
 	bool down, seen;
@@ -1369,6 +1407,7 @@ himax_poll(void)
 	}
 	if (himax_any_touch()) {
 		himax_find_peaks(peaks, &peaks_count);
+		himax_merge_peaks(peaks, &peaks_count);
 		for (unsigned i = 0; i < peaks_count && count < HIMAX_MAX_CONTACTS; i++) {
 			if (himax_centroid(&peaks[i], &sx[count], &sy[count])) {
 				count++;
@@ -1639,9 +1678,10 @@ himax_thread(__unused void *parameter, __unused wait_result_t result)
 			himax_poll();
 		}
 		if (tick % (30 * (1000000 / poll_us)) == 0) {
-			say_both("himax: so far %u frames in %u looks (%u bad, %u empty answers held back), %u finger positions (%u moves, the longest one drew %u), the last at %u, %u; "
+			say_both("himax: so far %u frames in %u looks (%u bad, %u empty answers held back, %u extra peaks merged), %u finger positions (%u moves, the longest one drew %u), the last at %u, %u; "
 			    "interrupt line %s; the line looked at every %u us\n",
-			    seen.reports, seen.polls, seen.bad, seen.stale, seen.touches, seen.moves, seen.trackmax,
+			    seen.reports, seen.polls, seen.bad, seen.stale, seen.merged,
+			    seen.touches, seen.moves, seen.trackmax,
 			    seen.last_x, seen.last_y,
 			    gpio_get(PIN_INT) ? "high" : "low", poll_us);
 			say_evidence();
