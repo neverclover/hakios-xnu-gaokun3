@@ -1052,6 +1052,77 @@ static uint32_t matrix_rest;
 #define ROW_MIX     0
 static uint8_t row_class[HIMAX_MAX_TX];
 
+/*
+ * The matrix is in five blocks of eight rows -- the panel drives eight lines at a time -- and the
+ * answer pays for that: a byte of bookkeeping between blocks, which turns every other block
+ * upside-down for one fixed reading place. That is what the last round's maps said without saying
+ * it: raw rows in one byte order exactly delta rows in the other, eight and one and eight apart
+ * -- the same quiet 0x8000, alternating phase. So each block is found on its own, drifting
+ * forward by whatever the bookkeeping costs; and the byte order falls out of the alignment that
+ * sees the most panel.
+ */
+#define HIMAX_BLOCK_ROWS        8
+#define HIMAX_BLOCK_BYTES       (2u * HIMAX_BLOCK_ROWS * HIMAX_MAX_RX)
+static uint32_t block_byte[HIMAX_MAX_TX / HIMAX_BLOCK_ROWS];
+
+static uint16_t himax_sample(int tx, int rx);	/* the aligned read: used before its place of rest */
+
+static uint32_t
+panel_ish(uint16_t v)
+{
+	return (v >= EQUILIBRIUM - 0x1000 && v <= EQUILIBRIUM + 0x1000) || v < 0x2800 || v >= 0xD800;
+}
+
+static void
+block_align(void)
+{
+	uint32_t best_total = 0;
+
+	for (int order = 0; order < 2; order++) {
+		uint32_t at[HIMAX_MAX_TX / HIMAX_BLOCK_ROWS];
+		uint32_t total = 0;
+		uint32_t nominal = matrix_off;
+
+		for (unsigned b = 0; b < HIMAX_MAX_TX / HIMAX_BLOCK_ROWS; b++) {
+			uint32_t best_here = nominal, best_hits = 0;
+
+			for (int d = 0; d <= 8; d++) {
+				uint32_t hits = 0;
+
+				for (int rr = 0; rr < HIMAX_BLOCK_ROWS; rr += 2) {
+					for (int c = 0; c < HIMAX_MAX_RX; c += 7) {
+						uint32_t addr = nominal + d + 2u * ((uint32_t)rr * HIMAX_MAX_RX + (uint32_t)c);
+						uint16_t v;
+
+						if (addr + 1 >= HIMAX_MAX_READ) {
+							continue;
+						}
+						v = le16(himax_rx + addr);
+						if (order) {
+							v = (uint16_t)((v >> 8) | (v << 8));
+						}
+						hits += panel_ish(v) != 0;
+					}
+				}
+				if (hits > best_hits) {
+					best_hits = hits;
+					best_here = nominal + d;
+				}
+			}
+			at[b] = best_here;
+			total += best_hits;
+			nominal = best_here + HIMAX_BLOCK_BYTES;
+		}
+		if (total > best_total) {
+			best_total = total;
+			matrix_swapped = order != 0;
+			for (unsigned b = 0; b < HIMAX_MAX_TX / HIMAX_BLOCK_ROWS; b++) {
+				block_byte[b] = at[b];
+			}
+		}
+	}
+}
+
 static uint16_t
 sample_at(const uint8_t *base, uint32_t word)
 {
@@ -1070,7 +1141,32 @@ himax_anchor(void)
 	 */
 	for (uint32_t i = 0; i + 2u * (HIMAX_MAX_TX * HIMAX_MAX_RX) <= HIMAX_MAX_READ && i < 330; i++) {
 		if (himax_rx[i] == 0x5a && himax_rx[i + 1] == 0x5a && himax_rx[i + 2] == 0xa5) {
+			uint32_t head = i + 2 + 2u * HIMAX_MAX_TX * HIMAX_MAX_RX;   /* one full matrix from the start */
+
+			if (head + 16 > HIMAX_MAX_READ) {
+				matrix_nosync++;      /* the report does not end inside our read: take the window from further in next time */
+				continue;
+			}
+			/*
+			 * The report is whole in the buffer when its arrays end before the next report's
+			 * header: zeros are fine there, ones are the next frame begun early -- which means
+			 * this window caught the writing, not a finished frame.
+			 */
+			{
+				uint32_t odd = 0;
+
+				for (uint32_t b = head; b + 1 < head + 16 && b + 1 < HIMAX_MAX_READ; b += 2) {
+					odd += le16(himax_rx + b) != 0;
+				}
+				if (odd > 4) {
+					matrix_nosync++;
+					continue;
+				}
+			}
 			matrix_off = i + 2;
+			for (unsigned b = 0; b < HIMAX_MAX_TX / HIMAX_BLOCK_ROWS; b++) {
+				block_byte[b] = matrix_off + b * HIMAX_BLOCK_BYTES;
+			}
 			return true;
 		}
 	}
@@ -1103,61 +1199,64 @@ row_band(int order, uint32_t at)
 static uint32_t best_rest(void);
 static uint32_t row_counts[4];
 
+static void frame_classify(uint8_t *out);
+
 static void
 frame_map(void)
 {
 	static bool shown;
-	int order_best = 0;
-	uint32_t seen_hit[2] = { 0, 0 };
 	char map[HIMAX_MAX_TX + 1];
 	uint32_t n_raw = 0, n_delta = 0, n_dead = 0, n_mix = 0;
 
-	for (int order = 0; order < 2; order++) {
-		for (int r = 0; r < HIMAX_MAX_TX; r++) {
-			for (int c = 0; c < HIMAX_MAX_RX; c += 3) {
-				seen_hit[order] += row_band(order, matrix_off + 2u * ((uint32_t)r * HIMAX_MAX_RX + (uint32_t)c)) != 0;
-			}
-		}
-	}
-	matrix_swapped = seen_hit[1] > seen_hit[0];
-
+	block_align();
+	frame_classify(row_class);
 	for (int r = 0; r < HIMAX_MAX_TX; r++) {
-		int raw = 0, delta = 0, zero = 0, total = 0;
-
-		for (int c = 0; c < HIMAX_MAX_RX; c += 3) {
-			uint32_t at = matrix_off + 2u * ((uint32_t)r * HIMAX_MAX_RX + (uint32_t)c);
-			int band = row_band(matrix_swapped ? 1 : 0, at);
-
-			total++;
-			if (le16(himax_rx + at) == 0) {
-				zero++;
-			}
-			raw += band == 1;
-			delta += band == 2;
-		}
-		if (raw * 10 >= total * 7) {
-			row_class[r] = ROW_RAW;
-			map[r] = 'R';
-			n_raw++;
-		} else if (delta * 10 >= total * 7) {
-			row_class[r] = ROW_DELTA;
-			map[r] = 'D';
-			n_delta++;
-		} else if (zero * 10 >= total * 9) {
-			row_class[r] = ROW_DEAD;
-			map[r] = '#';
-			n_dead++;
-		} else {
-			row_class[r] = ROW_MIX;
-			map[r] = '?';
-			n_mix++;
-		}
+		map[r] = row_class[r] == ROW_RAW ? 'R' : row_class[r] == ROW_DELTA ? 'D' : row_class[r] == ROW_DEAD ? '#' : '?';
+		n_raw += row_class[r] == ROW_RAW;
+		n_delta += row_class[r] == ROW_DELTA;
+		n_dead += row_class[r] == ROW_DEAD;
+		n_mix += row_class[r] == ROW_MIX;
 	}
 	map[HIMAX_MAX_TX] = 0;
-	row_counts[ROW_MIX] = n_mix; row_counts[ROW_RAW] = n_raw; row_counts[ROW_DELTA] = n_delta; row_counts[ROW_DEAD] = n_dead;
-	matrix_rest = best_rest();
-	say_both("himax: the matrix at byte %u reads %s; rows: %s (%u raw, %u delta, %u dead, %u mixed)\n",
-	    matrix_off, matrix_swapped ? "big-endian" : "little-endian", map, n_raw, n_delta, n_dead, n_mix);
+	/*
+	 * The map tells what the frame is; a second line says whether the map is a steady answer:
+	 * classified a second time on the same bytes, agreement out of forty is that answer. Two maps
+	 * that disagree (the first rounds here did, on the same frames: big-endian raw / little-endian
+	 * delta, the pattern one row off) meant the frame was not whole in the buffer; the whole-ness
+	 * check now below is what stops that.
+	 */
+	{
+		static uint8_t prev_class[HIMAX_MAX_TX];   /* steady means: this map matches the last frame's */
+		uint32_t agree = 0;
+
+		for (int r = 0; r < HIMAX_MAX_TX; r++) {
+			agree += row_class[r] == prev_class[r];
+			prev_class[r] = row_class[r];
+		}
+		say_both("himax: reads %s; blocks at %u +%d +%d +%d +%d; rows: %s; steady %u/%u\n",
+		    matrix_swapped ? "big-endian" : "little-endian", block_byte[0],
+		    (int)(block_byte[1] - block_byte[0] - HIMAX_BLOCK_BYTES),
+		    (int)(block_byte[2] - block_byte[1] - HIMAX_BLOCK_BYTES),
+		    (int)(block_byte[3] - block_byte[2] - HIMAX_BLOCK_BYTES),
+		    (int)(block_byte[4] - block_byte[3] - HIMAX_BLOCK_BYTES),
+		    map, agree, (unsigned)HIMAX_MAX_TX);
+	}
+	{
+	static unsigned maps_so_far;   /* frame_map may not see `seen` -- count its own runs */
+
+	if (maps_so_far++ == 0) {
+		say_both("himax: the matrix as it is read (%s):\n", matrix_swapped ? "big-endian" : "little-endian");
+		for (int r = 0; r < HIMAX_MAX_TX; r += 4) {
+			char line[13 * 6];
+			int at = 0;
+
+			for (int c = 0; c < HIMAX_MAX_RX; c += 11) {
+				at += snprintf(line + at, sizeof(line) - at, " %04x", himax_sample(r, c));
+			}
+			say_both("himax:  row %02d:%s\n", r, line);
+		}
+	}
+	}
 	if (!shown) {
 		shown = true;
 		if (matrix_off >= 6) {
@@ -1177,6 +1276,44 @@ frame_map(void)
 	}
 }
 
+static int
+row_band_value(uint16_t v)
+{
+	if (v >= EQUILIBRIUM - 0x1000 && v <= EQUILIBRIUM + 0x1000) {
+		return 1;
+	}
+	if (v < 0x2800 || v >= 0xD800) {
+		return 2;
+	}
+	return 0;
+}
+
+static void
+frame_classify(uint8_t *out)
+{
+	for (int r = 0; r < HIMAX_MAX_TX; r++) {
+		int raw = 0, delta = 0, zero = 0, total = 0;
+
+		for (int c = 0; c < HIMAX_MAX_RX; c += 3) {
+			uint16_t v = himax_sample(r, c);
+
+			total++;
+			zero += v == 0;
+			raw += row_band_value(v) == 1;
+			delta += row_band_value(v) == 2;
+		}
+		if (raw * 10 >= total * 7) {
+			out[r] = ROW_RAW;
+		} else if (delta * 10 >= total * 7) {
+			out[r] = ROW_DELTA;
+		} else if (zero * 10 >= total * 9) {
+			out[r] = ROW_DEAD;
+		} else {
+			out[r] = ROW_MIX;
+		}
+	}
+}
+
 static uint32_t
 best_rest(void)
 {
@@ -1187,7 +1324,7 @@ best_rest(void)
 			continue;
 		}
 		for (int c = 0; c < HIMAX_MAX_RX; c += 11) {
-			uint16_t v = sample_at(himax_rx + matrix_off, (uint32_t)r * HIMAX_MAX_RX + (uint32_t)c);
+			uint16_t v = himax_sample(r, c);
 
 			probe++;
 			if (row_class[r] == ROW_RAW) {
@@ -1205,7 +1342,17 @@ best_rest(void)
 static uint16_t
 himax_sample(int tx, int rx)
 {
-	return sample_at(himax_rx + matrix_off, (uint32_t)tx * HIMAX_MAX_RX + (uint32_t)rx);
+	uint32_t at;
+
+	if (tx < 0 || tx >= HIMAX_MAX_TX || rx < 0 || rx >= HIMAX_MAX_RX) {
+		return 0;
+	}
+	at = block_byte[tx / HIMAX_BLOCK_ROWS] +
+	    2u * ((uint32_t)(tx % HIMAX_BLOCK_ROWS) * HIMAX_MAX_RX + (uint32_t)rx);
+	if (at + 1 >= HIMAX_MAX_READ) {
+		return 0;
+	}
+	return sample_at(himax_rx + at, 0);
 }
 
 /* Inside the frame and a real finger: the deflection above rest, else 0. */
