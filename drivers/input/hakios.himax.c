@@ -1065,10 +1065,18 @@ static uint32_t row_byte[HIMAX_MAX_TX];
 
 static uint16_t himax_sample(int tx, int rx);	/* the aligned read: used before its place of rest */
 
+/*
+ * Score a reading by one thing only: the raw rest. The lesson of the walk's first run (drift a
+ * flat 2 everywhere, rows alternating D and R, the same quiet cells shown over and over as
+ * 0080/8000): a scorer that calls both rests "panel-ish" cannot find the phase, because a row of
+ * quiet 0x8000 read one byte off is a row of 0x0080 -- which belongs to the other band. The
+ * delta rows never existed; that was raw data read half a word off. The quiet raw cells are the
+ * clock signal of this format, so the clock alone decides where the rows start.
+ */
 static uint32_t
-panel_ish(uint16_t v)
+raw_ish(uint16_t v)
 {
-	return (v >= EQUILIBRIUM - 0x1000 && v <= EQUILIBRIUM + 0x1000) || v < 0x2800 || v >= 0xD800;
+	return v >= EQUILIBRIUM - 0x1000 && v <= EQUILIBRIUM + 0x1000;
 }
 
 static void
@@ -1098,7 +1106,7 @@ row_align(void)
 					if (order) {
 						v = (uint16_t)((v >> 8) | (v << 8));
 					}
-					hits += panel_ish(v) != 0;
+					hits += raw_ish(v) != 0;
 				}
 				if (hits > best_hits) {
 					best_hits = hits;
