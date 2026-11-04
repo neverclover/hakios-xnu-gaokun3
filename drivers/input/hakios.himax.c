@@ -1143,7 +1143,7 @@ himax_centroid(const struct himax_peak *peak, uint32_t *sx, uint32_t *sy)
 
 /* What has been seen so far: said once a minute, so that the end of the log always tells. */
 static struct {
-	uint32_t polls, reports, touches, bad, last_x, last_y;
+	uint32_t polls, reports, touches, bad, last_x, last_y, moves, trackmax;
 	uint32_t smin, smax;                  /* the sample values over all frames: an untouched panel rests at 0x8000 */
 	uint32_t types[4];                  /* how the stack's first data byte reads: the types the vendor names, and others */
 	uint32_t excited;                   /* frames where the range says something moved */
@@ -1161,7 +1161,7 @@ static struct {
 
 static struct {
 	bool down, seen;
-	uint32_t sx, sy, x, y;
+	uint32_t sx, sy, x, y, dx0, dy0;
 } contact[HIMAX_MAX_CONTACTS];
 
 static void
@@ -1223,13 +1223,23 @@ himax_report(unsigned count, const uint32_t *sx, const uint32_t *sy)
 		contact[best].seen = true;
 		contact[best].sx = x;
 		contact[best].sy = y;
+		/* scale once, here: a MOVE that carries an old position is how a drawn line turns into a tap */
+		post_x = mult_frac(panel_x, 65535, PANEL_X - 1);
+		post_y = mult_frac(panel_y, 65535, PANEL_Y - 1);
 		if (!contact[best].down) {
 			contact[best].down = true;
-			post_x = mult_frac(panel_x, 65535, PANEL_X - 1);
-			post_y = mult_frac(panel_y, 65535, PANEL_Y - 1);
+			contact[best].dx0 = panel_x;
+			contact[best].dy0 = panel_y;
 			hakios_touch_post(HAKIOS_TOUCH_DOWN, best, post_x, post_y);
 		} else if (contact[best].x != panel_x || contact[best].y != panel_y) {
+			uint32_t run_x = panel_x > contact[best].dx0 ? panel_x - contact[best].dx0 : contact[best].dx0 - panel_x;
+			uint32_t run_y = panel_y > contact[best].dy0 ? panel_y - contact[best].dy0 : contact[best].dy0 - panel_y;
+
 			hakios_touch_post(HAKIOS_TOUCH_MOVE, best, post_x, post_y);
+			seen.moves++;
+			if (run_x + run_y > seen.trackmax) {
+				seen.trackmax = run_x + run_y;
+			}
 		}
 		contact[best].x = panel_x;
 		contact[best].y = panel_y;
@@ -1610,9 +1620,10 @@ himax_thread(__unused void *parameter, __unused wait_result_t result)
 			himax_poll();
 		}
 		if (tick % (30 * (1000000 / poll_us)) == 0) {
-			say_both("himax: so far %u frames in %u looks (%u bad), %u finger positions, the last at %u, %u; "
+			say_both("himax: so far %u frames in %u looks (%u bad), %u finger positions (%u moves, the longest one drew %u), the last at %u, %u; "
 			    "interrupt line %s; the line looked at every %u us\n",
-			    seen.reports, seen.polls, seen.bad, seen.touches, seen.last_x, seen.last_y,
+			    seen.reports, seen.polls, seen.bad, seen.touches, seen.moves, seen.trackmax,
+			    seen.last_x, seen.last_y,
 			    gpio_get(PIN_INT) ? "high" : "low", poll_us);
 			say_evidence();
 		}
