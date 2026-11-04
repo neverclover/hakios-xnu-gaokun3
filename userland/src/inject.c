@@ -564,6 +564,79 @@ wait_for_als_arrival(__unused id self, __unused SEL selector)
 	}
 }
 
+/*
+ * The idle of this machine's screen. The userland asks, at every startup, for display sleep
+ * after three seconds -- the interval it keeps during a first boot -- and the sleep it starts
+ * ends in a screen no wake lifts (there is no backlight here to lift: the dim is what that
+ * software path has, and it has nothing that comes back). So the number is answered with a
+ * working day: the request stands, its size is set straight, in the one place the interval is
+ * spoken. The class is looked for by name and the replacement is reported, as everywhere in
+ * this file: found means said, absent means left.
+ */
+static void (*original_set_idle_interval)(id self, SEL selector, double interval);
+
+static void
+set_idle_interval(id self, SEL selector, double interval)
+{
+	static int told;
+
+	if (!told) {
+		told = 1;
+		say("hakios: idle sleep was asked for %.0f seconds; this screen stays: %.0f\n", interval, 86400.0);
+	}
+	original_set_idle_interval(self, selector, 86400.0);
+}
+
+static void
+keep_lit(void)
+{
+	void (*auto_off)(bool) = dlsym(RTLD_DEFAULT, "BKSDisplayBrightnessSetAutoBrightnessEnabled");
+	void (*set_level)(double) = dlsym(RTLD_DEFAULT, "BKSDisplayBrightnessSet");
+
+	if (auto_off != NULL) {
+		auto_off(false);
+		say("hakios: the light sensor this machine has is none; auto-brightness is off\n");
+	} else if (set_level == NULL) {
+		say("hakios: BKSDisplayBrightnessSetAutoBrightnessEnabled: not this userland's name; left\n");
+	}
+	if (auto_off != NULL && set_level != NULL) {
+		set_level(0.5);   /* the level the machine itself asked for at startup */
+	}
+}
+
+/*
+ * Auto-brightness, on a machine with no light sensor. The userland asks the sensor at
+ * startup, gets its timeout (the log says so: "timeout waiting for ALS arrival"), and
+ * carries on with the one curve it has: an absent sensor reads as a dark room, and the
+ * floor of that curve is zero. So every idle fade lands the screen at true black and no
+ * wake lifts it again -- the wake asks the same curve and gets the same zero. Here there
+ * is nothing to measure and no light to adapt to: turn the adaptation off and set the
+ * level, the way a person would at Settings / Accessibility / Display. Both names are
+ * looked for, not assumed (BackBoardServices.tbd, iOS 16.5, lists them). keep_lit is
+ * idempotent; it is said twice on purpose (see the constructor).
+ */
+__attribute__((unused)) static void
+idle_sleep_fixes(void)
+{
+	SEL setter = sel_registerName("setIdleSleepInterval:");
+	const char *const classes[] = { "BKSSystemShellService", "BKSSystemShellServiceConnection" };
+
+	for (unsigned i = 0; i < sizeof(classes) / sizeof(classes[0]); i++) {
+		Class cls = objc_getClass(classes[i]);
+		Method method = cls ? class_getInstanceMethod(cls, setter) : NULL;
+
+		if (method == NULL) {
+			continue;
+		}
+		original_set_idle_interval = (void (*)(id, SEL, double))method_setImplementation(
+		    method, (IMP)set_idle_interval);
+		say("hakios: -[%s setIdleSleepInterval:]: replaced; the interval will be answered with a working day\n",
+		    classes[i]);
+		return;
+	}
+	say("hakios: no -[. setIdleSleepInterval:] in this userland; left as asked\n");
+}
+
 __attribute__((unused)) static void
 brightness_fixes(void)
 {
@@ -1093,30 +1166,16 @@ hakios_init(void)
 		char arguments[1024] = "";
 		size_t size = sizeof(arguments) - 1;
 
+		keep_lit();
 		/*
-		 * Auto-brightness, on a machine with no light sensor. The userland asks the sensor at
-		 * startup, gets its timeout (the log says so: "timeout waiting for ALS arrival"), and
-		 * carries on with the one curve it has: an absent sensor reads as a dark room, and the
-		 * floor of that curve is zero. So every idle fade lands the screen at true black and no
-		 * wake lifts it again -- the wake asks the same curve and gets the same zero. Here there
-		 * is nothing to measure and no light to adapt to: turn the adaptation off and set the
-		 * level once, the way a person would at Settings / Accessibility / Display. Both names
-		 * are looked for, not assumed (BackBoardServices.tbd, iOS 16.5, lists them).
+		 * ... and once more after the system has made its own preferences known: the log of a
+		 * real startup shows the BrightnessSystem instantiated seconds later and its stored
+		 * DisplayBrightnessAuto=1 written then -- the word said at load time would be walked
+		 * over. Ten seconds after, the machine is up and the preference is the one to change.
 		 */
-		{
-			void (*auto_off)(bool) = dlsym(RTLD_DEFAULT, "BKSDisplayBrightnessSetAutoBrightnessEnabled");
-			void (*set_level)(double) = dlsym(RTLD_DEFAULT, "BKSDisplayBrightnessSet");
-
-			if (auto_off != NULL) {
-				auto_off(false);
-				say("hakios: the light sensor this machine has is none; auto-brightness is off\n");
-			} else {
-				say("hakios: BKSDisplayBrightnessSetAutoBrightnessEnabled: not this userland's name; left\n");
-			}
-			if (auto_off != NULL && set_level != NULL) {
-				set_level(0.5);   /* the level the machine itself asked for at startup */
-			}
-		}
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
+		    ^{ keep_lit(); });
+		idle_sleep_fixes();		/* and the sleep that dims: its interval is answered elsewhere */
 
 		/*
 		 * Boot-arg ca_vbl=1: CoreAnimation's frame clock from the display driver's refresh
