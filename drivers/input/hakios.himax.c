@@ -1033,6 +1033,7 @@ mult_frac(uint32_t value, uint32_t multiply, uint32_t divide)
  */
 static uint32_t matrix_off;                    /* every frame says where; nothing assumed */
 static bool matrix_swapped;                    /* decided once at the anchor, both orders counted */
+static bool matrix_raw;                          /* and whether the frame is raw capacitance or deltas -- also decided there */
 static uint32_t matrix_rest;                   /* percent of probe samples at their rest there */
 static uint32_t matrix_nosync;                 /* answers with no recognizable frame start */
 
@@ -1058,42 +1059,107 @@ himax_anchor(void)
 }
 
 /*
- * What sits at the anchor, in which byte order: counted once and kept, not per frame -- a model
- * that changes with the luck of one quiet frame was last round's mistake. Both orders are
- * counted; the one that finds more of the frame at rest is the order the frame is written in.
+ * The first whole frame says what kind of frames these are. Both byte orders and both rests --
+ * the quiet zero of deltas, the 0x8000 of raw capacitance -- are counted at the anchored place,
+ * and the reading that believes the most becomes the reading. Then the frame itself is written
+ * out: sampled rows of the matrix in hex, so that if any of this is still wrong the bytes say
+ * so in the log and there is nothing left to guess. Once decided, kept -- a model that changes
+ * with the luck of one frame was last round's mistake.
  */
+static uint32_t best_rest(void);
+
 static void
 frame_validate(void)
 {
 	static bool decided;
-	uint32_t ok[2] = { 0, 0 }, probe = 0;
+	uint32_t cnt[2][2] = { { 0, 0 }, { 0, 0 } };   /* [order][0 = delta rest, 1 = raw rest] */
+	uint32_t probe = 0;
 
-	for (int swap = 0; swap < 2; swap++) {
-		for (int r = 0; r < HIMAX_MAX_TX; r += 4) {
-			for (int c = 0; c < HIMAX_MAX_RX; c += 11) {
+	for (int order = 0; order < 2; order++) {
+		for (int r = 0; r < HIMAX_MAX_TX; r += 3) {
+			for (int c = 0; c < HIMAX_MAX_RX; c += 7) {
 				uint16_t v = le16(himax_rx + matrix_off + 2u * ((uint32_t)r * HIMAX_MAX_RX + (uint32_t)c));
 
-				if (swap) {
+				if (order) {
 					v = (uint16_t)((v >> 8) | (v << 8));
 				}
-				if (v < 0x2800 || v >= 0xD800) {      /* a delta frame's rest: small around zero */
-					ok[swap]++;
+				if (v < 0x2800 || v >= 0xD800) {
+					cnt[order][0]++;
 				}
-				probe++;
+				if (v >= EQUILIBRIUM - 0x1000 && v <= EQUILIBRIUM + 0x1000) {
+					cnt[order][1]++;
+				}
+			}
+		}
+		probe += 1;
+	}
+	probe = 0;
+	for (int r = 0; r < HIMAX_MAX_TX; r += 3) {
+		for (int c = 0; c < HIMAX_MAX_RX; c += 7) {
+			probe++;
+		}
+	}
+	{
+		uint32_t best = 0;
+		int best_order = 0, best_kind = 0;
+
+		for (int order = 0; order < 2; order++) {
+			for (int kind = 0; kind < 2; kind++) {
+				if (cnt[order][kind] > best) {
+					best = cnt[order][kind];
+					best_order = order;
+					best_kind = kind;
+				}
+			}
+		}
+		if (!decided) {
+			decided = true;
+			matrix_swapped = best_order != 0;
+			matrix_raw = best_kind != 0;
+			say_both("himax: the first whole frame at byte %u: order L delta %u%% raw %u%%, order B delta %u%% raw %u%% -- reading as %s %s\n",
+			    matrix_off, cnt[0][0] * 100 / probe, cnt[0][1] * 100 / probe,
+			    cnt[1][0] * 100 / probe, cnt[1][1] * 100 / probe,
+			    matrix_swapped ? "big-endian" : "little-endian",
+			    matrix_raw ? "raw capacitance" : "deltas");
+			if (matrix_off >= 6) {
+				printf("himax: frame at byte %u begins:", matrix_off - 6);
+				for (int i = 0; i < 6; i++) {
+					printf(" %02x", himax_rx[matrix_off - 6 + (uint32_t)i]);
+				}
+				printf("\n");
+			}
+			for (int r = 0; r < HIMAX_MAX_TX; r += 4) {
+				printf("himax: row %02d:", r);
+				for (int c = 0; c < HIMAX_MAX_RX; c += 5) {
+					printf(" %04x", le16(himax_rx + matrix_off + 2u * ((uint32_t)r * HIMAX_MAX_RX + (uint32_t)c)));
+				}
+				printf("\n");
 			}
 		}
 	}
-	if (!decided) {
-		decided = true;
-		matrix_swapped = ok[1] > ok[0];
-		say_both("himax: the anchored matrix reads %s: %u/%u probe cells sit at their rest\n",
-		    matrix_swapped ? "big-endian" : "little-endian", ok[1] > ok[0] ? ok[1] : ok[0], probe);
-	}
-	{
-		uint32_t better = ok[1] > ok[0] ? ok[1] : ok[0];
+	matrix_rest = best_rest();
+}
 
-		matrix_rest = probe ? better * 100 / probe : 0;
+static uint32_t
+best_rest(void)
+{
+	uint32_t inside = 0, probe = 0;
+
+	for (int r = 0; r < HIMAX_MAX_TX; r += 4) {
+		for (int c = 0; c < HIMAX_MAX_RX; c += 11) {
+			uint16_t v = sample_at(himax_rx + matrix_off, (uint32_t)r * HIMAX_MAX_RX + (uint32_t)c);
+
+			probe++;
+			if (matrix_raw) {
+				if (v >= EQUILIBRIUM - 0x1000 && v <= EQUILIBRIUM + 0x1000) {
+					inside++;
+				}
+			} else if (v < 0x2800 || v >= 0xD800) {
+				inside++;
+			}
+		}
 	}
+	return probe ? inside * 100 / probe : 0;
 }
 
 static uint16_t
@@ -1120,6 +1186,9 @@ himax_filtered(int tx, int rx)
 	 * greater than EQUILIBRIUM"); it never saw this firmware's frames, we have.
 	 */
 	value = himax_sample(tx, rx);
+	if (matrix_raw) {
+		return (EQUILIBRIUM + DOWN_THRESHOLD < value) && (value < EQUILIBRIUM + UP_THRESHOLD) ? (uint16_t)(value - EQUILIBRIUM) : 0;
+	}
 	return value < 0x2800 ? value : 0;
 }
 
@@ -1454,14 +1523,27 @@ himax_poll(void)
 
 	seen.polls++;
 	/*
-	 * The interrupt line is the chip's way of saying "a report is ready" (the device tree calls
-	 * it level-low for exactly that). Ask when it does not say so and you get an empty answer,
-	 * and an empty answer decodes as "no touch" -- which lifts a finger in the middle of a
-	 * drawn line and turns the line into a row of taps. The vendor's driver only ever read on
-	 * the interrupt; this is that, with a level instead of an edge.
+	 * One read per assertion of the line, and after it wait for the line to free: the event
+	 * stack is a queue of whole reports, and reading it on a level -- as the last round did --
+	 * catches half a report as often as a whole one. A half report is a matrix with its back
+	 * half zeros: the peaks of one hand scatter over the whole frame, and the merge of them
+	 * churns nine thousand times. The vendor's driver reads exactly once on exactly this
+	 * interrupt; this is that, with the level watched at 8 ms instead of an edge.
 	 */
-	if (gpio_get(PIN_INT)) {
-		return;
+	{
+		int lvl = gpio_get(PIN_INT);
+		static bool read_since_assert;
+
+		if (read_since_assert) {
+			if (lvl == 0) {
+				return;                 /* the report was already taken; wait for the queue to empty */
+			}
+			read_since_assert = false;
+		}
+		if (lvl != 0) {
+			return;                     /* nothing has been offered since the last read */
+		}
+		read_since_assert = true;
 	}
 	if (!himax_set_burst_mode(true)) {
 		goto bad;
@@ -1776,10 +1858,10 @@ himax_thread(__unused void *parameter, __unused wait_result_t result)
 			himax_poll();
 		}
 		if (tick % (30 * (1000000 / poll_us)) == 0) {
-			say_both("himax: so far %u frames in %u looks (%u bad, %u empty answers held back, %u extra peaks merged, %u without a frame start; anchored at byte %u, %u%% at rest), %u finger positions (%u moves, the longest one drew %u), the last at %u, %u; "
+			say_both("himax: so far %u frames in %u looks (%u bad, %u empty answers held back, %u extra peaks merged, %u without a frame start; anchored at byte %u as %s, %u%% at rest), %u finger positions (%u moves, the longest one drew %u), the last at %u, %u; "
 			    "interrupt line %s; the line looked at every %u us\n",
 			    seen.reports, seen.polls, seen.bad, seen.stale, seen.merged,
-			    matrix_nosync, matrix_off, matrix_rest,
+			    matrix_nosync, matrix_off, matrix_raw ? "raw" : "delta", matrix_rest,
 			    seen.touches, seen.moves, seen.trackmax,
 			    seen.last_x, seen.last_y,
 			    gpio_get(PIN_INT) ? "high" : "low", poll_us);
