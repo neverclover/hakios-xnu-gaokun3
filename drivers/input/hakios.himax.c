@@ -688,8 +688,18 @@ static bool (*spi_transfer)(const uint8_t *tx, uint8_t *rx, uint32_t length);
 
 /* the frame read (what those four are is explained at the report section below); sized so that
    every bus helper and the report share one pair of buffers big enough for the largest read */
-#define HIMAX_MAX_TX                    40              /* the rows of the frame */
-#define HIMAX_MAX_RX                    60              /* and its columns */
+/*
+ * Transposed by the calibration taps, and this is what the corner data demanded: taps at top and
+ * bottom landed at the SAME bottom band (the axis we read as columns never moved), while taps left
+ * and right moved the axis we read as rows cleanly end to end. The frame's rows are the SIXTY-line
+ * axis (26.7 px pitch, the panel's width responds along it once read straight); the columns are
+ * the forty. Every constant in this file grows from these two -- the walk, the maps, the
+ * geometry -- which is why the fix is here and nowhere else. The old values were not invented
+ * wrong: the vendor's own headers carry them for their scan; the answer on this board walks the
+ * matrix the other way.
+ */
+#define HIMAX_MAX_TX                    60              /* rows of the frame: the drive axis that spans the panel width */
+#define HIMAX_MAX_RX                    40              /* columns: the sense axis that spans its height */
 #define HIMAX_FRAME_OFF                 4               /* the vendor's OFST, from the start of the receive buffer */
 #define HIMAX_FRAME_BYTES               (2 * HIMAX_MAX_TX * HIMAX_MAX_RX)
 #define HIMAX_REPORT_BYTES              5132U   /* the vendor's FULL_STACK_SZ: header, matrix, and the arrays after it */
@@ -989,8 +999,14 @@ himax_gaokun_wake(void)
 #define UP_THRESHOLD            0x1000
 
 /* The frame's extent in the sensor's own coordinates, and the vendor's scaling factors. */
-#define X_TOTAL                 25600U                  /* gk3.dts's touchscreen-size-x */
-#define Y_TOTAL                 16000U                  /* and its -y */
+/*
+ * gk3.dts's touchscreen-size-x/-y are the totals of the sensor's axes -- and its -x belongs to the
+ * SIXTY-count axis, which is now read as the rows (Y below, feeding the panel's width through the
+ * swap); -y is the forty-count axis, the columns (X below, feeding the panel's height). The names
+ * keep the dts's letters for comparison with its numbers; the axes keep the truth the taps told.
+ */
+#define X_TOTAL                 16000U                  /* the forty-line axis: the panel's height */
+#define Y_TOTAL                 25600U                  /* the sixty-line axis: the panel's width */
 #define X_SCALE                 9U
 #define Y_SCALE                 1U
 #define X_TOTAL_REV             (X_SCALE * X_TOTAL * (HIMAX_MAX_RX + 1) / HIMAX_MAX_RX)
@@ -1659,10 +1675,12 @@ himax_report(unsigned count, const uint32_t *sx, const uint32_t *sy)
 			}
 		}
 		/*
-		 * gk3.dts: touchscreen-inverted-x first, then touchscreen-swapped-x-y; its own
-		 * comment says the two do not commute, so the order is as written. Invert the
-		 * sensor's x (sx' = 25600 - sx), then take the panel from the swapped pair:
-		 * panel_x = sy * 1600 / 16000, panel_y = sx' * 2560 / 25600.
+		 * The swapped frame reads straight at last: the sixty-line row axis (sy) spans the
+		 * panel's width -- a left press computes small, a right press large, so it goes
+		 * un-inverted -- and the forty-line column axis (sx) spans its height. The dts inverts
+		 * one of them and the corner taps cannot yet say which end is zero: the height is
+		 * inverted here (the reading that matches the dts's letter); the next five taps will
+		 * confirm it or name the flip, and it is a one-line flip either way.
 		 */
 		uint32_t panel_x = (uint32_t)(((uint64_t)y * PANEL_X) / Y_TOTAL);
 		uint32_t panel_y = (uint32_t)(((uint64_t)(X_TOTAL - x) * PANEL_Y) / X_TOTAL);
