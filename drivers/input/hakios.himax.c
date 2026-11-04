@@ -1143,7 +1143,7 @@ himax_centroid(const struct himax_peak *peak, uint32_t *sx, uint32_t *sy)
 
 /* What has been seen so far: said once a minute, so that the end of the log always tells. */
 static struct {
-	uint32_t polls, reports, touches, bad, last_x, last_y, moves, trackmax;
+	uint32_t polls, reports, touches, bad, last_x, last_y, moves, trackmax, stale;
 	uint32_t smin, smax;                  /* the sample values over all frames: an untouched panel rests at 0x8000 */
 	uint32_t types[4];                  /* how the stack's first data byte reads: the types the vendor names, and others */
 	uint32_t excited;                   /* frames where the range says something moved */
@@ -1260,7 +1260,7 @@ himax_report(unsigned count, const uint32_t *sx, const uint32_t *sy)
  * when the samples do not rest at 0x8000 is the matrix offset, and the second is the framing; this
  * is what would say so, in the same export as everything else.
  */
-static void
+static bool
 himax_forensics(void)
 {
 	const uint8_t *m = himax_rx + HIMAX_BUS_R_HLEN;
@@ -1305,6 +1305,12 @@ himax_forensics(void)
 		}
 		seen.excited++;
 	}
+	/*
+	 * An event stack nobody has written reads as all zeros; a real frame with no touch in it
+	 * reads at the equilibrium, 0x8000-ish everywhere. The first is "there was nothing to read"
+	 * -- not "the finger lifted" -- and the difference is everything to a drawn line.
+	 */
+	return hi != 0 || lo != 0;
 }
 
 /* Burst-read the frame and turn its peaks into fingers. */
@@ -1317,6 +1323,16 @@ himax_poll(void)
 	uint32_t total = HIMAX_BUS_R_HLEN + HIMAX_REPORT_BYTES;
 
 	seen.polls++;
+	/*
+	 * The interrupt line is the chip's way of saying "a report is ready" (the device tree calls
+	 * it level-low for exactly that). Ask when it does not say so and you get an empty answer,
+	 * and an empty answer decodes as "no touch" -- which lifts a finger in the middle of a
+	 * drawn line and turns the line into a row of taps. The vendor's driver only ever read on
+	 * the interrupt; this is that, with a level instead of an edge.
+	 */
+	if (gpio_get(PIN_INT)) {
+		return;
+	}
 	if (!himax_set_burst_mode(true)) {
 		goto bad;
 	}
@@ -1343,8 +1359,11 @@ himax_poll(void)
 		}
 		done += trunk;
 	}
+	if (!himax_forensics()) {
+		seen.stale++;                 /* nothing was there to read: hold every finger as it is */
+		return;
+	}
 	seen.reports++;
-	himax_forensics();
 	for (unsigned i = 0; i < HIMAX_MAX_CONTACTS; i++) {
 		contact[i].seen = false;
 	}
@@ -1620,9 +1639,9 @@ himax_thread(__unused void *parameter, __unused wait_result_t result)
 			himax_poll();
 		}
 		if (tick % (30 * (1000000 / poll_us)) == 0) {
-			say_both("himax: so far %u frames in %u looks (%u bad), %u finger positions (%u moves, the longest one drew %u), the last at %u, %u; "
+			say_both("himax: so far %u frames in %u looks (%u bad, %u empty answers held back), %u finger positions (%u moves, the longest one drew %u), the last at %u, %u; "
 			    "interrupt line %s; the line looked at every %u us\n",
-			    seen.reports, seen.polls, seen.bad, seen.touches, seen.moves, seen.trackmax,
+			    seen.reports, seen.polls, seen.bad, seen.stale, seen.touches, seen.moves, seen.trackmax,
 			    seen.last_x, seen.last_y,
 			    gpio_get(PIN_INT) ? "high" : "low", poll_us);
 			say_evidence();
