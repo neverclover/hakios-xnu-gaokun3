@@ -1139,39 +1139,34 @@ himax_anchor(void)
 	 * matrix begins two bytes after it. Search wider than 32 bytes: a good fifth of the answers
 	 * keep their head farther down the window, and refusing those is refusing real frames.
 	 */
+	{
+	uint32_t head_at = 0;
+	bool found = false;
+
+	/*
+	 * Take the last report in the window, not the first: this is a ring, so the first is the
+	 * oldest thing the chip still holds -- a quarter second behind the finger in the worst case.
+	 * The last header whose matrix fits is the newest frame, and the newest frame is what a
+	 * hand is asking to be answered.
+	 */
 	for (uint32_t i = 0; i + 2u * (HIMAX_MAX_TX * HIMAX_MAX_RX) <= HIMAX_MAX_READ && i < 330; i++) {
 		if (himax_rx[i] == 0x5a && himax_rx[i + 1] == 0x5a && himax_rx[i + 2] == 0xa5) {
-			uint32_t head = i + 2 + 2u * HIMAX_MAX_TX * HIMAX_MAX_RX;   /* one full matrix from the start */
-
-			if (head + 16 > HIMAX_MAX_READ) {
-				matrix_nosync++;      /* the report does not end inside our read: take the window from further in next time */
-				continue;
-			}
-			/*
-			 * The report is whole in the buffer when its arrays end before the next report's
-			 * header: zeros are fine there, ones are the next frame begun early -- which means
-			 * this window caught the writing, not a finished frame.
-			 */
-			{
-				uint32_t odd = 0;
-
-				for (uint32_t b = head; b + 1 < head + 16 && b + 1 < HIMAX_MAX_READ; b += 2) {
-					odd += le16(himax_rx + b) != 0;
-				}
-				if (odd > 4) {
-					matrix_nosync++;
-					continue;
-				}
-			}
-			matrix_off = i + 2;
-			for (unsigned b = 0; b < HIMAX_MAX_TX / HIMAX_BLOCK_ROWS; b++) {
-				block_byte[b] = matrix_off + b * HIMAX_BLOCK_BYTES;
-			}
-			return true;
+			found = true;
+			head_at = i;
+		}
+		if (false) {
 		}
 	}
-	matrix_nosync++;
-	return false;
+	if (!found) {
+		matrix_nosync++;
+		return false;
+	}
+	matrix_off = head_at + 2;   /* accepted on the signature: the maps of the last rounds were built on this rule; the whole-ness check added with the blocks was an over-correction -- it refused every frame on the assumption that a report ends quiet, but after the matrix come the tx and rx arrays, panel data themselves, never quiet */
+	for (unsigned b = 0; b < HIMAX_MAX_TX / HIMAX_BLOCK_ROWS; b++) {
+		block_byte[b] = matrix_off + b * HIMAX_BLOCK_BYTES;
+	}
+	return true;
+	}
 }
 
 static int
