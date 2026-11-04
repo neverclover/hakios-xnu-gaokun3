@@ -1012,10 +1012,77 @@ mult_frac(uint32_t value, uint32_t multiply, uint32_t divide)
 	return (uint32_t)(((uint64_t)value * multiply) / divide);
 }
 
+/*
+ * Where the matrix actually is. It is asked, not assumed: the IC starts driving MISO when it is
+ * ready, so the answer of a burst read carries a prefix of one length this time and another the
+ * next (the same frame content has been seen to begin two bytes apart in two consecutive
+ * captures), and the vendor's four-byte header counts from a buffer that carries no bus prefix at
+ * all. A fixed reading place is therefore a coin toss between the matrix and noise -- noise peaks
+ * sit wherever, which is what a drawn line turned into. So every so often the answer is looked
+ * at: the place and byte order where the most samples sit at the panel's equilibrium is the
+ * matrix, and that is where the next 128 frames are read.
+ */
+static uint32_t matrix_off = HIMAX_FRAME_OFF;    /* the old fixed assumption, until looking says better */
+static bool matrix_swapped;
+static uint32_t matrix_rest;                     /* percent of probe samples inside the equilibrium band there */
+static uint32_t matrix_falls;                    /* times looking found no matrix at all */
+
+static uint16_t
+sample_at(const uint8_t *base, uint32_t word)
+{
+	uint16_t v = le16(base + 2u * word);
+
+	return matrix_swapped ? (uint16_t)((v >> 8) | (v << 8)) : v;
+}
+
+static void
+matrix_look(const uint8_t *answer, uint32_t length)
+{
+	uint32_t best = 0, best_at = 0;
+	bool best_swap = false;
+
+	/* probe 240 words every tenth across 2400 bytes of the answer, for every prefix up to half
+	   the answer long: the matrix needs only to overlap the probe, wherever its start is */
+	for (uint32_t off = 0; off + 2u * (239u * 10u + 1u) <= length; off += 2) {
+		for (int swap = 0; swap < 2; swap++) {
+			uint32_t inside = 0;
+
+			for (uint32_t i = 0; i < 240; i++) {
+				uint16_t v = le16(answer + off + 2u * (i * 10u));
+
+				if (swap) {
+					v = (uint16_t)((v >> 8) | (v << 8));
+				}
+				if (v >= EQUILIBRIUM - 0x1000 && v <= EQUILIBRIUM + 0x1000) {
+					inside++;
+				}
+			}
+			if (inside > best) {
+				best = inside;
+				best_at = off;
+				best_swap = swap != 0;
+			}
+		}
+	}
+	if (best < 240 * 6 / 10) {
+		matrix_falls++;
+		say_both("himax: no matrix found in the answer (%u/240 samples at the equilibrium anywhere); reading on at byte %u\n",
+		    best, matrix_off);
+		return;
+	}
+	if (best_at != matrix_off || best_swap != matrix_swapped) {
+		say_both("himax: the matrix is at byte %u of the answer%s: %u%% of it sits at the equilibrium\n",
+		    best_at, best_swap ? " (big-endian words)" : "", best * 100 / 240);
+	}
+	matrix_off = best_at;
+	matrix_swapped = best_swap;
+	matrix_rest = best * 100 / 240;
+}
+
 static uint16_t
 himax_sample(int tx, int rx)
 {
-	return le16(himax_rx + HIMAX_FRAME_OFF + 2u * ((uint32_t)tx * HIMAX_MAX_RX + (uint32_t)rx));
+	return sample_at(himax_rx + matrix_off, (uint32_t)tx * HIMAX_MAX_RX + (uint32_t)rx);
 }
 
 /* Inside the frame and a real finger: the value above equilibrium, else 0 (the vendor's simple_filter). */
@@ -1143,7 +1210,7 @@ himax_centroid(const struct himax_peak *peak, uint32_t *sx, uint32_t *sy)
 
 /* What has been seen so far: said once a minute, so that the end of the log always tells. */
 static struct {
-	uint32_t polls, reports, touches, bad, last_x, last_y, moves, trackmax, stale, merged;
+	uint32_t polls, reports, touches, bad, last_x, last_y, moves, trackmax, stale, merged, moff;
 	uint32_t smin, smax;                  /* the sample values over all frames: an untouched panel rests at 0x8000 */
 	uint32_t types[4];                  /* how the stack's first data byte reads: the types the vendor names, and others */
 	uint32_t excited;                   /* frames where the range says something moved */
@@ -1348,7 +1415,18 @@ himax_forensics(void)
 	 * reads at the equilibrium, 0x8000-ish everywhere. The first is "there was nothing to read"
 	 * -- not "the finger lifted" -- and the difference is everything to a drawn line.
 	 */
-	return hi != 0 || lo != 0;
+	if (!(hi != 0 || lo != 0)) {
+		return false;
+	}
+	{
+		static unsigned since_look = 128;   /* ask the very first real frame where it is */
+
+		if (since_look++ >= 128) {
+			since_look = 0;
+			matrix_look(himax_rx, HIMAX_BUS_R_HLEN + HIMAX_REPORT_BYTES);
+		}
+	}
+	return true;
 }
 
 /* Burst-read the frame and turn its peaks into fingers. */
@@ -1678,9 +1756,10 @@ himax_thread(__unused void *parameter, __unused wait_result_t result)
 			himax_poll();
 		}
 		if (tick % (30 * (1000000 / poll_us)) == 0) {
-			say_both("himax: so far %u frames in %u looks (%u bad, %u empty answers held back, %u extra peaks merged), %u finger positions (%u moves, the longest one drew %u), the last at %u, %u; "
+			say_both("himax: so far %u frames in %u looks (%u bad, %u empty answers held back, %u extra peaks merged; matrix at byte %u, %u%% at rest), %u finger positions (%u moves, the longest one drew %u), the last at %u, %u; "
 			    "interrupt line %s; the line looked at every %u us\n",
 			    seen.reports, seen.polls, seen.bad, seen.stale, seen.merged,
+			    matrix_off, matrix_rest,
 			    seen.touches, seen.moves, seen.trackmax,
 			    seen.last_x, seen.last_y,
 			    gpio_get(PIN_INT) ? "high" : "low", poll_us);
