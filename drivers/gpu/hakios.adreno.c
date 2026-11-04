@@ -1,4 +1,14 @@
 /*
+ * This build's GPU is the MateBook E Go's (gaokun3, SC8280XP): an Adreno A690. The island sits
+ * at the same addresses with the same layout as the phone's -- core 3d00000, GMU 3d6a000, RSCC
+ * 3de0000, PDC b290000, GPUCC 3d90000, SMMU 3da0000, GDSCs at the same offsets -- which is why
+ * the steps below carry over; what differs is the card itself and its zap shader. Linux drives
+ * this chip (a690) with the SAME GMU and SQE images a660 uses -- so the phone's firmware names
+ * stay -- but its shader is signed for the SC8280XP and ships under the machine's own name; the
+ * device tree names it, qcdxkmsuc8280.mbn, and the copy taken here is the sibling machine's for
+ * the very same SoC. The speed bins of this chip are not in any table I have; a fuse read at a
+ * borrowed offset would be a guess printed as a fact, so it is not read.
+ *
  * The GPU of the POCO X5 Pro (redwood), an Adreno 642L, woken step by step up to a picture that
  * it fills and the panel shows. Every address below belongs to this phone, and nothing here is
  * touched unless a boot-arg asks for it.
@@ -91,6 +101,8 @@
  * cmd-db.c, drivers/firmware/qcom/qcom_scm{,-smc}.c, drivers/soc/qcom/mdt_loader.c. The phone's
  * vendor kernel agrees on every offset used here, and is the only source for the frequency counter.
  */
+#include <stdarg.h>
+#include <string.h>
 #include <kern/clock.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -107,6 +119,7 @@ extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
 
 static uint32_t last_step, skip_steps, pause_ms = 2200, fine, watch_seconds = 20;
 static uint32_t step;                   /* the one being performed */
+
 static uint32_t speed_bin;              /* which of the GPUs of this kind the fuses say this is (step 2) */
 static uint32_t newest_step;            /* the highest one asked for: the one that has not been seen to work */
 static char last_write[96] = "nothing written";
@@ -119,6 +132,10 @@ static bool quiet;                      /* repeating accesses that have been ann
  * as well, before the next register is touched.
  */
 extern void loader_log_putc(char c);
+
+static char adreno_last_said[200];   /* the last word said, for the standing tell to repeat */
+
+extern void loader_status(const char *fmt, ...) __printflike(1, 2);
 
 static int say(const char *format, ...) __printflike(1, 2);
 
@@ -133,6 +150,21 @@ say(const char *format, ...)
 	va_end(list);
 	for (const char *c = line; *c != 0; c++) {
 		loader_log_putc(*c);
+	}
+	/*
+	 * And keep it: the export of a machine reads the loader's small status ring, and the touch
+	 * driver's minute tell fills it -- the GPU's last word would scroll out of the readable part
+	 * in minutes. The standing tell repeats it there, so whatever the GPU reached and whatever
+	 * stopped it is in every export, beside the touch census.
+	 */
+	{
+		unsigned at = 0;
+
+		while (line[at] && at < sizeof(adreno_last_said) - 1) {
+			adreno_last_said[at] = line[at];
+			at++;
+		}
+		adreno_last_said[at] = '\0';
 	}
 	return printf("%s", line);
 }
@@ -436,20 +468,29 @@ step_fuses(void)
 	uint32_t bin, gaming;
 
 	announce("read the GPU's fuses in the error-corrected copy (0x784000), which Linux reads");
+	/*
+	 * The phone's bins live at fuses of its own; the A690's bins, if it has them, are not in
+	 * any table this file was written against, and this SoC's qfprom begins at 784000, not at
+	 * the block's low edge. Reading a borrowed offset would print a guess as a fact: so the
+	 * bins are left at zero -- they only ever pick a name and a clock ceiling -- and said.
+	 */
+	printf("adreno: %u: this SoC's speed bins are not in this driver's tables; not reading fuses, working from the device tree's model (Adreno A690)\n", step);
+	goto bins_known;
 	bin = get8(&qfprom, "speed bin, low", QFPROM_CORRECTED + QFPROM_GPU_SPEED_BIN);
 	bin |= get8(&qfprom, "speed bin, high", QFPROM_CORRECTED + QFPROM_GPU_SPEED_BIN + 1) << 8;
 	bin = bin >> 5 & 0xff;
 	speed_bin = bin;
 	gaming = get8(&qfprom, "gaming bin", QFPROM_CORRECTED + QFPROM_GPU_GAMING_BIN) >> 5 & 1;
 	/* dt: qcom,gpu-models: 0xac and 0xbe are sold as Adreno 643, anything else is the 642L */
-	printf("adreno: %u: speed bin %u: an Adreno %s; gaming bin %u\n", step, bin, bin == 0xac || bin == 0xbe ? "643" : "642L",
-	    gaming);
+	printf("adreno: %u: bins unread here; the device tree says an Adreno A690 (a690.0.0)\n", step);
 
 	announce("read the same fuses where the phone's device tree has them (0x780000)");
 	bin = get8(&qfprom, "raw speed bin, low", QFPROM_GPU_SPEED_BIN);
 	bin |= get8(&qfprom, "raw speed bin, high", QFPROM_GPU_SPEED_BIN + 1) << 8;
 	printf("adreno: %u: raw speed bin %u\n", step, bin >> 5 & 0xff);
 	return true;
+bins_known:
+	;
 }
 
 /* ---- step 3: the GPU's clock controller ----------------------------------------------------------------- */
@@ -1630,7 +1671,7 @@ image_file(const char *directory, const char *name, uint64_t *size)
 /*
  * The first of the three calls with which Linux has a zap shader loaded (mdt_loader.c:
  * qcom_mdt_pas_init, qcom_scm.c: qcom_scm_pas_init_image): TrustZone is given the image's header --
- * the ELF header and the block of hashes and certificates, which is all of the file a660_zap.mdt
+ * the ELF header and the block of hashes and certificates, which is all of the file qcdxkmsuc8280.mbn
  * -- and checks the signature. Nothing of the GPU is involved, so it can be asked now. The other
  * two (where the image will be, and "authenticate and start") need the 3D core powered.
  *
@@ -1648,7 +1689,7 @@ zap_header(uint64_t *phys)
 	uint64_t size = 0;
 	uint32_t segments, hashes;
 
-	header = image_file("fw", "a660_zap.mdt", &size);
+	header = image_file("fw", "qcdxkmsuc8280.mbn", &size);
 	if (header == NULL) {
 		return false;
 	}
@@ -1682,7 +1723,7 @@ step_zap_signature(void)
 	uint64_t header = 0, answer = ~0ull;
 	int32_t result;
 
-	announce("find the zap shader's header, fw/a660_zap.mdt, in the small image that came with the kernel");
+	announce("find the zap shader's header, fw/qcdxkmsuc8280.mbn -- the name this machine's own device tree gives -- in the small image that came with the kernel");
 	if (!zap_header(&header)) {
 		return false;
 	}
@@ -3556,6 +3597,8 @@ hakios_adreno_minute(void)
 	int32_t tenths[2];
 
 	if (!gpu_kept) {
+		/* no picture to keep awake: say, where the reading export looks, where the steps ended */
+		loader_status("adreno: last step %u; the last word said: %s", last_step, adreno_last_said);
 		return;
 	}
 	need(&tsens);
