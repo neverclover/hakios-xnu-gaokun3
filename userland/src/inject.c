@@ -591,7 +591,15 @@ static void
 keep_lit(void)
 {
 	void (*auto_off)(bool) = dlsym(RTLD_DEFAULT, "BKSDisplayBrightnessSetAutoBrightnessEnabled");
-	void (*set_level)(double) = dlsym(RTLD_DEFAULT, "BKSDisplayBrightnessSet");
+
+	/*
+	 * This one takes a float. The first machine said so itself: passing 0.5 as a double left
+	 * the low 32 bits of the double -- zero -- in the argument register, and the log wrote
+	 * "brightness change:0 ... (permanent)" at the very moment of the call. A person reading
+	 * the Control Center saw that zero. The type is declared straight here, and the value is
+	 * 0.5f: what is said is what is meant.
+	 */
+	void (*set_level)(float) = dlsym(RTLD_DEFAULT, "BKSDisplayBrightnessSet");
 
 	if (auto_off != NULL) {
 		auto_off(false);
@@ -600,7 +608,7 @@ keep_lit(void)
 		say("hakios: BKSDisplayBrightnessSetAutoBrightnessEnabled: not this userland's name; left\n");
 	}
 	if (auto_off != NULL && set_level != NULL) {
-		set_level(0.5);   /* the level the machine itself asked for at startup */
+		set_level(0.5f);  /* the level the machine itself asked for at startup -- as a float, which is what it takes */
 	}
 }
 
@@ -635,6 +643,47 @@ idle_sleep_fixes(void)
 		return;
 	}
 	say("hakios: no -[. setIdleSleepInterval:] in this userland; left as asked\n");
+}
+
+/*
+ * The floor of the dim. Display sleep, however far the interval is answered, ends with the
+ * backlight subsystem ramping the panel to a minimum level -- here always 0.0, on a phone with
+ * a real backlight fading out to a dark panel that a wake lifts again. This machine has no
+ * backlight to lift: the ramp to zero is the whole of the darkness, and what lifts it is a
+ * person's patience. So the floor is answered no lower than the level the machine itself
+ * chose at startup: a sleep that dims to the same brightness is a screen that stays readable,
+ * and every other part of the power story runs as asked. The class is the backlight control
+ * of this very process, whose method for the wait of a light sensor this file already answers.
+ */
+static void (*original_set_minimum)(id self, SEL selector, double level, double fade);
+
+static void
+set_minimum_floor(id self, SEL selector, double level, double fade)
+{
+	static int told;
+
+	if (!told && level < 0.4) {
+		told = 1;
+		say("hakios: a dim to %.1f was asked; this screen's floor is 0.5\n", level);
+	}
+	if (level < 0.5) {
+		level = 0.5;
+	}
+	original_set_minimum(self, selector, level, fade);
+}
+
+__attribute__((unused)) static void
+brightness_floor(void)
+{
+	Class cls = objc_getClass("BLControl");
+	Method method = cls ? class_getInstanceMethod(cls, sel_registerName("setMinimumBrightnessLevel:fadeDuration:")) : NULL;
+
+	if (method == NULL) {
+		say("hakios: no -[BLControl setMinimumBrightnessLevel:fadeDuration:]; the dim keeps its floor of zero\n");
+		return;
+	}
+	original_set_minimum = (void (*)(id, SEL, double, double))method_setImplementation(method, (IMP)set_minimum_floor);
+	say("hakios: -[BLControl setMinimumBrightnessLevel:fadeDuration:]: replaced; the floor is the level\n");
 }
 
 __attribute__((unused)) static void
@@ -1176,6 +1225,7 @@ hakios_init(void)
 		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
 		    ^{ keep_lit(); });
 		idle_sleep_fixes();		/* and the sleep that dims: its interval is answered elsewhere */
+		brightness_floor();		/* ... and its floor is raised where the interval answer missed */
 
 		/*
 		 * Boot-arg ca_vbl=1: CoreAnimation's frame clock from the display driver's refresh

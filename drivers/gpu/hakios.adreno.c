@@ -490,7 +490,13 @@ step_fuses(void)
 	printf("adreno: %u: raw speed bin %u\n", step, bin >> 5 & 0xff);
 	return true;
 bins_known:
-	;
+	/*
+	 * The skip path lands here -- and a function that says whether it worked must say it on
+	 * every path. (The first machine proved the cost of not saying: the jump went past the
+	 * return, w0 carried whatever it was carrying, and a step that had been answered honestly
+	 * was reported as failed. The steps after it were not attempted, for nothing.)
+	 */
+	return true;
 }
 
 /* ---- step 3: the GPU's clock controller ----------------------------------------------------------------- */
