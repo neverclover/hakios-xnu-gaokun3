@@ -692,7 +692,7 @@ static bool (*spi_transfer)(const uint8_t *tx, uint8_t *rx, uint32_t length);
 #define HIMAX_MAX_RX                    60              /* and its columns */
 #define HIMAX_FRAME_OFF                 4               /* the vendor's OFST, from the start of the receive buffer */
 #define HIMAX_FRAME_BYTES               (2 * HIMAX_MAX_TX * HIMAX_MAX_RX)
-#define HIMAX_REPORT_BYTES              (HIMAX_FRAME_OFF + HIMAX_FRAME_BYTES)
+#define HIMAX_REPORT_BYTES              5132U   /* the vendor's FULL_STACK_SZ: header, matrix, and the arrays after it */
 
 #define HIMAX_MAX_READ                  (HIMAX_BUS_R_HLEN + HIMAX_REPORT_BYTES)
 static uint8_t himax_tx[HIMAX_MAX_READ + 8], himax_rx[HIMAX_MAX_READ + 8];
@@ -1024,8 +1024,9 @@ mult_frac(uint32_t value, uint32_t multiply, uint32_t divide)
  */
 static uint32_t matrix_off = HIMAX_FRAME_OFF;    /* the old fixed assumption, until looking says better */
 static bool matrix_swapped;
-static uint32_t matrix_rest;                     /* percent of probe samples inside the equilibrium band there */
-static uint32_t matrix_falls;                    /* times looking found no matrix at all */
+static bool matrix_raw = true;                   /* raw capacitance (at rest 0x8000) or deltas (at rest 0)? the frame says */
+static uint32_t matrix_rest;                     /* percent of probe samples inside the chosen model's rest band */
+static uint32_t matrix_falls;                    /* times looking found nothing to believe */
 
 static uint16_t
 sample_at(const uint8_t *base, uint32_t word)
@@ -1035,48 +1036,87 @@ sample_at(const uint8_t *base, uint32_t word)
 	return matrix_swapped ? (uint16_t)((v >> 8) | (v << 8)) : v;
 }
 
+/*
+ * Where the matrix is, and what kind of numbers it holds. The answers of this firmware turned out
+ * to have neither a fixed prefix nor -- as the first looking found -- a sea of 0x8000 anywhere in
+ * them: at the best place and order only half of the samples sat at the raw equilibrium. The
+ * vendor's stack sizes hint at why: the answer carries the matrix and more arrays besides, and
+ * this RawOut mode is known to mix per-channel changes in with the raw cells. So the frame is
+ * asked two questions at once -- at which byte, and in which order, do the samples look most like
+ * a panel at rest; and which rest does it keep: the raw equilibrium around 0x8000, or the quiet
+ * zero of deltas? The model with the more believing samples is the one read.
+ */
+static bool
+rest_raw(uint16_t v)
+{
+	return v >= EQUILIBRIUM - 0x1000 && v <= EQUILIBRIUM + 0x1000;
+}
+
+static bool
+rest_delta(uint16_t v)
+{
+	return v < 0x2800 || v >= 0xD800;            /* small positive, or a small negative in two's complement */
+}
+
+static uint32_t
+count_rest(const uint8_t *answer, uint32_t off, bool swap, bool raw)
+{
+	uint32_t inside = 0;
+
+	/* probe 96 cells spread over twenty rows of the matrix -- enough to weigh a model, cheap enough
+	   to weigh many */
+	for (int r = 0; r < 20; r += 2) {
+		for (int c = 0; c < 60; c += 6) {
+			uint16_t v = le16(answer + off + 2u * ((uint32_t)r * HIMAX_MAX_RX + (uint32_t)c));
+
+			if (swap) {
+				v = (uint16_t)((v >> 8) | (v << 8));
+			}
+			if (raw ? rest_raw(v) : rest_delta(v)) {
+				inside++;
+			}
+		}
+	}
+	return inside;
+}
+
+#define PROBES          (20 / 2 * (60 / 6))
+
 static void
 matrix_look(const uint8_t *answer, uint32_t length)
 {
 	uint32_t best = 0, best_at = 0;
-	bool best_swap = false;
+	bool best_swap = false, best_raw = true;
 
-	/* probe 240 words every tenth across 2400 bytes of the answer, for every prefix up to half
-	   the answer long: the matrix needs only to overlap the probe, wherever its start is */
-	for (uint32_t off = 0; off + 2u * (239u * 10u + 1u) <= length; off += 2) {
+	for (uint32_t off = 0; off + 2u * HIMAX_MAX_TX * HIMAX_MAX_RX <= length; off += 2) {
 		for (int swap = 0; swap < 2; swap++) {
-			uint32_t inside = 0;
+			for (int raw = 0; raw < 2; raw++) {
+				uint32_t inside = count_rest(answer, off, swap != 0, raw != 0);
 
-			for (uint32_t i = 0; i < 240; i++) {
-				uint16_t v = le16(answer + off + 2u * (i * 10u));
-
-				if (swap) {
-					v = (uint16_t)((v >> 8) | (v << 8));
+				if (inside > best) {
+					best = inside;
+					best_at = off;
+					best_swap = swap != 0;
+					best_raw = raw != 0;
 				}
-				if (v >= EQUILIBRIUM - 0x1000 && v <= EQUILIBRIUM + 0x1000) {
-					inside++;
-				}
-			}
-			if (inside > best) {
-				best = inside;
-				best_at = off;
-				best_swap = swap != 0;
 			}
 		}
 	}
-	if (best < 240 * 6 / 10) {
+	if (best < PROBES / 3) {
 		matrix_falls++;
-		say_both("himax: no matrix found in the answer (%u/240 samples at the equilibrium anywhere); reading on at byte %u\n",
-		    best, matrix_off);
+		say_both("himax: no matrix found anywhere in the answer (%u/%u samples at any rest); reading on at byte %u\n",
+		    best, (unsigned)PROBES, matrix_off);
 		return;
 	}
-	if (best_at != matrix_off || best_swap != matrix_swapped) {
-		say_both("himax: the matrix is at byte %u of the answer%s: %u%% of it sits at the equilibrium\n",
-		    best_at, best_swap ? " (big-endian words)" : "", best * 100 / 240);
+	if (best_at != matrix_off || best_swap != matrix_swapped || best_raw != matrix_raw) {
+		say_both("himax: the matrix is at byte %u of the answer%s, as %s: %u%% of it sits at its rest\n",
+		    best_at, best_swap ? " (big-endian words)" : "",
+		    best_raw ? "raw capacitance (rest 0x8000)" : "deltas (rest zero)", best * 100 / PROBES);
 	}
 	matrix_off = best_at;
 	matrix_swapped = best_swap;
-	matrix_rest = best * 100 / 240;
+	matrix_raw = best_raw;
+	matrix_rest = best * 100 / PROBES;
 }
 
 static uint16_t
@@ -1095,6 +1135,11 @@ himax_filtered(int tx, int rx)
 		return 0;
 	}
 	value = himax_sample(tx, rx);
+	if (!matrix_raw) {
+		/* a delta frame: at rest zero, a finger a positive change; small negatives (two's complement
+		 * high) are noise, big negatives are dead channels */
+		return value < 0x2800 ? value : 0;
+	}
 	return (EQUILIBRIUM + DOWN_THRESHOLD < value) && (value < EQUILIBRIUM + UP_THRESHOLD) ? (uint16_t)(value - EQUILIBRIUM) : 0;
 }
 
@@ -1756,10 +1801,10 @@ himax_thread(__unused void *parameter, __unused wait_result_t result)
 			himax_poll();
 		}
 		if (tick % (30 * (1000000 / poll_us)) == 0) {
-			say_both("himax: so far %u frames in %u looks (%u bad, %u empty answers held back, %u extra peaks merged; matrix at byte %u, %u%% at rest), %u finger positions (%u moves, the longest one drew %u), the last at %u, %u; "
+			say_both("himax: so far %u frames in %u looks (%u bad, %u empty answers held back, %u extra peaks merged; matrix at byte %u as %s, %u%% at rest), %u finger positions (%u moves, the longest one drew %u), the last at %u, %u; "
 			    "interrupt line %s; the line looked at every %u us\n",
 			    seen.reports, seen.polls, seen.bad, seen.stale, seen.merged,
-			    matrix_off, matrix_rest,
+			    matrix_off, matrix_raw ? "raw" : "delta", matrix_rest,
 			    seen.touches, seen.moves, seen.trackmax,
 			    seen.last_x, seen.last_y,
 			    gpio_get(PIN_INT) ? "high" : "low", poll_us);
