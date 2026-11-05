@@ -1227,6 +1227,7 @@ static uint32_t matrix_torn;                   /* (kept for the statistics' hist
  * a hardware oracle to set our matrix-computed numbers against.
  */
 static uint32_t chip_selfresets;               /* times word 6 said the firmware reset itself */
+static bool chip_rearm;                        /* and it is now deaf until we re-ask what init asked */
 static uint16_t chip_x, chip_y;                /* the chip's own point, last it had one */
 static bool chip_point;                        /* it had one this frame */
 static uint32_t matrix_rest;
@@ -1364,8 +1365,16 @@ himax_anchor(void)
 	chip_point = false;
 	if (matrix_off + HIMAX_FRAME_BYTES + 2u * 56u <= HIMAX_MAX_READ) {
 		const uint8_t *tbl = himax_rx + matrix_off + HIMAX_FRAME_BYTES;
-		if (le16(tbl + 12) != 0 && chip_selfresets++ == 0) {
-			say_both("himax: the chip says its firmware reset itself -- that is a silence explained\n");
+		if (le16(tbl + 12) != 0) {
+			if (chip_selfresets++ == 0) {
+				say_both("himax: the chip says its firmware reset itself -- that is a silence explained\n");
+			}
+			/*
+			 * The vendor's SOS handling: a firmware that reset itself lost everything the
+			 * initialization asked of it -- the rawdata window, the one-frame promise, the
+			 * front-end calibration. Wake it, ask again, in the order init used.
+			 */
+			chip_rearm = true;
 		}
 		uint16_t cx = le16(tbl + 108), cy = le16(tbl + 110);
 		if (cx != 0xFF && cy != 0xFF) {
@@ -2378,6 +2387,14 @@ himax_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	printf("himax: himax touch screen ready; the interrupt line is looked at every %u us\n", poll_us);
 	for (unsigned tick = 1;; tick++) {
+		if (chip_rearm) {
+			chip_rearm = false;
+			say_both("himax: the front end is being asked again, as after an initialization\n");
+			(void) himax_gaokun_wake();
+			if (himax_raw_frames()) {
+				himax_sense_on();
+			}
+		}
 		/* the interrupt line is low while a frame waits; look anyway every 80 ms in case it is missed */
 		if (!gpio_get(PIN_INT)) {
 			idle = 0;
