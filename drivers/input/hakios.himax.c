@@ -1717,7 +1717,11 @@ himax_report(unsigned count, const uint32_t *sx, const uint32_t *sy)
 			contact[best].off = 0;
 			contact[best].sus = 0;
 			if (taps++ < 6) {
-				say_both("himax: tap at %u, %u (of %u x %u)\n", panel_x, panel_y, PANEL_X, PANEL_Y);
+				/* the raw axis values too: a five-point calibration against KNOWN corners reads
+				 * these, not the guessed panel numbers -- which axis the touch really moved is
+				 * seen here, and the affine is then computed once, correctly, not retuned blind. */
+				say_both("himax: tap at %u, %u (of %u x %u); axis %u, %u (cells %u of %u, %u of %u)\n", panel_x, panel_y,
+				    PANEL_X, PANEL_Y, x, y, y / DY, HIMAX_MAX_TX, x / DX, HIMAX_MAX_RX);
 			}
 			hakios_touch_post(HAKIOS_TOUCH_DOWN, best, post_x, post_y);
 		} else if (contact[best].x != panel_x || contact[best].y != panel_y) {
