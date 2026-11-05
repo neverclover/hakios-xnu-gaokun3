@@ -1788,6 +1788,14 @@ static struct {
 	unsigned off;                       /* reports in a row this finger has been absent from */
 	unsigned sus;                       /* a jump too big to believe is pending: 1 = unproven, where */
 	uint32_t susx, susy;
+	/*
+	 * The same witness, for beginnings: a first sighting of a blob is held one report, and
+	 * it becomes a press only if the next one sits at it again. A blob that lives a single
+	 * report out of sixty is what a lifting fingertip, a palm edge, a flick of the wrist
+	 * look like -- the five-point test named them ghosts; the frame named them singletons.
+	 */
+	bool pend;
+	uint32_t pendx, pendy;
 } contact[HIMAX_MAX_CONTACTS];
 
 static bool
@@ -1892,13 +1900,26 @@ himax_report(unsigned count, const uint32_t *sx, const uint32_t *sy)
 		post_y = mult_frac(panel_y, 65535, PANEL_Y - 1);
 		if (!contact[best].down) {
 			static unsigned taps;      /* where presses land: the five-point calibration reads these */
+			int pdx = (int)(x > contact[best].pendx ? x - contact[best].pendx : contact[best].pendx - x);
+			int pdy = (int)(y > contact[best].pendy ? y - contact[best].pendy : contact[best].pendy - y);
 
+			if (!contact[best].pend || pdx + pdy > 4 * 430) {
+				/* first word of a possible press: hold it, do not post it */
+				contact[best].pend = true;
+				contact[best].pendx = x;
+				contact[best].pendy = y;
+			} else {
+				contact[best].pend = false;
+			}
+			if (contact[best].pend) {
+				continue;       /* still a witness away from being a press */
+			}
 			contact[best].down = true;
 			contact[best].dx0 = panel_x;
 			contact[best].dy0 = panel_y;
 			contact[best].off = 0;
 			contact[best].sus = 0;
-			if (taps++ < 6) {
+			if (taps++ < 10) {
 				/* the raw axis values too: a five-point calibration against KNOWN corners reads
 				 * these, not the guessed panel numbers -- which axis the touch really moved is
 				 * seen here, and the affine is then computed once, correctly, not retuned blind. */
@@ -1941,6 +1962,7 @@ himax_report(unsigned count, const uint32_t *sx, const uint32_t *sy)
 		} else {
 			contact[id].down = false;
 			contact[id].off = 0;
+			contact[id].pend = false;
 			hakios_touch_post(HAKIOS_TOUCH_UP, id, mult_frac(contact[id].x, 65535, PANEL_X - 1),
 			    mult_frac(contact[id].y, 65535, PANEL_Y - 1));
 		}
