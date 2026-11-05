@@ -1030,6 +1030,23 @@ himax_chip_command(uint8_t id, uint8_t value, unsigned *slot)
 	return true;
 }
 
+/*
+ * One attempt at writing four bytes back-and-verifying, their retry loop distilled.
+ */
+static bool
+reg_try(uint32_t addr, const uint8_t *want, uint32_t n)
+{
+	uint8_t back[4];
+
+	for (int i = 0; i < 10; i++) {
+		if (himax_register_write(addr, want, n) && himax_register_read(addr, back, n) &&
+		    memcmp(back, want, n) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static void
 himax_sense_on(void)
 {
@@ -1044,11 +1061,46 @@ himax_sense_on(void)
 	};
 	unsigned slot = 0;
 	uint8_t zeros[0x50];
-	uint8_t name[16];
+	uint8_t word[4], name[16];
 
 	memset(zeros, 0, sizeof(zeros));
 	(void) himax_register_write(0x10007550, zeros, sizeof(zeros));
 	(void) himax_register_write(0x1000753C, zeros, 4);
+
+	/*
+	 * The vendor's first three steps, which we never took -- and "one complete frame per
+	 * interrupt" is the one that matters most. Without it the chip's stack keeps a ring of
+	 * older frames, so a read that looks like the newest is a quarter-second old, and older
+	 * still after a burst of motion: ghosts and jumps describe themselves. (Their order from
+	 * EGoTouchRev: unlock the psram rawdata pointer at 0x10000000, assign the sorting mode
+	 * -- EGO_RAWDATA is the plain zero -- set N_frame to one, then confirm the data type by
+	 * reading 0xf6 back where we already wrote it.)
+	 */
+	word[0] = 0x00;                                   /* the low half of the end pointer, as they send it */
+	word[1] = 0x00;
+	word[2] = 0x00;
+	word[3] = 0x00;
+	if (reg_try(0x10000000, word, 4)) {
+		say_both("himax: the rawdata window was opened\n");
+	} else {
+		say_both("himax: the rawdata window would not open\n");
+	}
+	word[0] = 0; word[1] = 0; word[2] = 0; word[3] = 0;
+	(void) reg_try(0x10007f04, word, 4);             /* sorting mode: EGO_RAWDATA = zero */
+	word[0] = 1; word[1] = 0; word[2] = 0; word[3] = 0;
+	if (reg_try(0x10007294, word, 4)) {
+		word[0] = 0x01;                              /* and the armed form: 0x7F0C0000 + 1 */
+		word[1] = 0x00;
+		word[2] = 0x0c;
+		word[3] = 0x7F;
+		if (reg_try(0x10007294, word, 4)) {
+			say_both("himax: one complete frame per interrupt was asked\n");
+		}
+	} else {
+		say_both("himax: the frame-count ask did not take\n");
+	}
+	word[0] = 0xf6; word[1] = 0; word[2] = 0; word[3] = 0;
+	(void) reg_try(0x100072ec, word, 4);             /* read their 0xf6 back where ours lives */
 
 	if (himax_register_read(0x10007014, name, sizeof(name))) {
 		/* the firmware's own project string: the panel this configuration was built for.
