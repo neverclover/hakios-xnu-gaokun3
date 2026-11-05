@@ -983,6 +983,93 @@ himax_gaokun_wake(void)
 	return false;
 }
 
+/*
+ * Sense ON -- the two commands the vendor's Init ends with, and the step we never did.
+ * Their word for the state reached after them is "Initialization and Sense ON successful";
+ * without them the analog front end answers with its power-on defaults, and the geometry of
+ * which channels mean what drifts with however the chip last woke. The channel is the vendor's,
+ * read out of their DLL by EGoTouchRev: five 16-byte slots at 0x10007550 (the write pointer at
+ * 0x1000753C); a packet carries id at byte 2 and value at byte 4, its last two bytes hold a
+ * two's-complement sum taken over the packet as though it began with the virtual header A8 8A
+ * -- then four trigger bytes A8 8A id 00 to the same address, and a read back for the answer.
+ */
+static bool
+himax_chip_command(uint8_t id, uint8_t value, unsigned *slot)
+{
+	uint8_t packet[16], trigger[4], answer[16];
+	uint32_t addr = 0x10007550 + (uint32_t)(*slot) * 0x10u, sum = 0;
+
+	memset(packet, 0, sizeof(packet));
+	packet[0] = 0xa8;
+	packet[1] = 0x8a;
+	packet[2] = id;
+	packet[4] = value;
+	for (int i = 0; i < 16; i += 2) {
+		sum += (uint32_t)packet[i] | ((uint32_t)packet[i + 1] << 8);
+	}
+	uint16_t check = (uint16_t)((0x10000u - sum) & 0xffffu);
+	/* the header the checksum was computed over is virtual: the wire packet starts zeroed */
+	packet[0] = 0;
+	packet[1] = 0;
+	packet[14] = (uint8_t)check;
+	packet[15] = (uint8_t)(check >> 8);
+	trigger[0] = 0xa8;
+	trigger[1] = 0x8a;
+	trigger[2] = id;
+	trigger[3] = 0;
+	if (!himax_register_write(addr, packet, sizeof(packet))) {
+		return false;
+	}
+	if (!himax_register_write(addr, trigger, sizeof(trigger))) {
+		return false;
+	}
+	if (!himax_register_read(addr, answer, sizeof(answer))) {
+		return false;
+	}
+	*slot = (*slot + 1) % 5u;
+	return true;
+}
+
+static void
+himax_sense_on(void)
+{
+	static const struct {
+		uint8_t id, value;
+		const char *what;
+	} asks[] = {
+		/* 0x01: the front end measures its own rest. 0x0e value 0: the 120 Hz scan rate --
+		 * both non-fatal in the vendor's own code ("the chip may use its default rate"). */
+		{ 0x01, 0x00, "calibrate its front end" },
+		{ 0x0e, 0x00, "scan at 120 Hz" },
+	};
+	unsigned slot = 0;
+	uint8_t zeros[0x50];
+	uint8_t name[16];
+
+	memset(zeros, 0, sizeof(zeros));
+	(void) himax_register_write(0x10007550, zeros, sizeof(zeros));
+	(void) himax_register_write(0x1000753C, zeros, 4);
+
+	if (himax_register_read(0x10007014, name, sizeof(name))) {
+		/* the firmware's own project string: the panel this configuration was built for.
+		 * Their known list for this machine is W273AS27xx/13xx -- say what the chip says. */
+		char printable[17];
+		int n = 0;
+		for (int i = 0; i < (int)sizeof(name) && name[i] >= 0x20 && name[i] < 0x7f; i++) {
+			printable[n++] = (char)name[i];
+		}
+		printable[n] = 0;
+		say_both("himax: the chip names its own project: \"%s\"\n", printable);
+	}
+	for (unsigned a = 0; a < sizeof(asks) / sizeof(asks[0]); a++) {
+		if (himax_chip_command(asks[a].id, asks[a].value, &slot)) {
+			say_both("himax: the chip was asked to %s\n", asks[a].what);
+		} else {
+			say_both("himax: the chip did not take the ask to %s\n", asks[a].what);
+		}
+	}
+}
+
 /* ---- the touch report ----------------------------------------------------------------------------- */
 
 /*
@@ -2094,6 +2181,9 @@ bring_up(void)
 	if (!himax_raw_frames()) {
 		return -1;
 	}
+	/* the vendor's last steps, after which their code says "Sense ON successful": a front
+	 * end left at its defaults is what "the geometry changes between boots" looks like. */
+	himax_sense_on();
 	return 1;
 }
 
