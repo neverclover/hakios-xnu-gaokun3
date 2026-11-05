@@ -1227,7 +1227,6 @@ static uint32_t matrix_torn;                   /* (kept for the statistics' hist
  * a hardware oracle to set our matrix-computed numbers against.
  */
 static uint32_t chip_selfresets;               /* times word 6 said the firmware reset itself */
-static bool chip_rearm;                        /* and it is now deaf until we re-ask what init asked */
 static uint16_t chip_x, chip_y;                /* the chip's own point, last it had one */
 static bool chip_point;                        /* it had one this frame */
 static uint32_t matrix_rest;
@@ -1366,15 +1365,14 @@ himax_anchor(void)
 	if (matrix_off + HIMAX_FRAME_BYTES + 2u * 56u <= HIMAX_MAX_READ) {
 		const uint8_t *tbl = himax_rx + matrix_off + HIMAX_FRAME_BYTES;
 		if (le16(tbl + 12) != 0) {
+			/*
+				 * Only a witness: the boot's own reload sets this word too, and r57 answered
+				 * that with a storm of five re-inits. The symptom worth acting on is silence,
+				 * and the polling loop watches for it there, bounded.
+				 */
 			if (chip_selfresets++ == 0) {
 				say_both("himax: the chip says its firmware reset itself -- that is a silence explained\n");
 			}
-			/*
-			 * The vendor's SOS handling: a firmware that reset itself lost everything the
-			 * initialization asked of it -- the rawdata window, the one-frame promise, the
-			 * front-end calibration. Wake it, ask again, in the order init used.
-			 */
-			chip_rearm = true;
 		}
 		uint16_t cx = le16(tbl + 108), cy = le16(tbl + 110);
 		if (cx != 0xFF && cy != 0xFF) {
@@ -2387,14 +2385,6 @@ himax_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	printf("himax: himax touch screen ready; the interrupt line is looked at every %u us\n", poll_us);
 	for (unsigned tick = 1;; tick++) {
-		if (chip_rearm) {
-			chip_rearm = false;
-			say_both("himax: the front end is being asked again, as after an initialization\n");
-			(void) himax_gaokun_wake();
-			if (himax_raw_frames()) {
-				himax_sense_on();
-			}
-		}
 		/* the interrupt line is low while a frame waits; look anyway every 80 ms in case it is missed */
 		if (!gpio_get(PIN_INT)) {
 			idle = 0;
@@ -2429,6 +2419,40 @@ himax_thread(__unused void *parameter, __unused wait_result_t result)
 			    seen.last_x, seen.last_y, gpio_get(PIN_INT) ? "high" : "low", poll_us,
 			peak_max, peak_hist[0], peak_hist[1], peak_hist[2], peak_hist[3]);
 			say_evidence();
+			/*
+			 * The bounded answer to silence: two whole statistics windows without a single
+			 * frame -- whatever any status word claims -- wake the chip and ask init's
+			 * questions again. Three asks, then touch waits for a warmer boot: r57's storm
+			 * was exactly what an unbounded answer looks like. (Idle panels do go quiet by
+			 * design; three bounded re-asks cost nothing and a dead chip would otherwise
+			 * stay dead for the session.)
+			 */
+			{
+				static uint32_t last_reports;
+				static unsigned quiet_windows, rearms;
+
+				if (seen.reports == last_reports) {
+					quiet_windows++;
+				} else {
+					quiet_windows = 0;
+				}
+				last_reports = seen.reports;
+				if (quiet_windows >= 2) {
+					quiet_windows = 0;
+					if (rearms < 3) {
+						rearms++;
+						say_both("himax: sixty seconds without a frame: waking the chip and asking init's questions again (%u of 3)\n",
+						    rearms);
+						(void) himax_gaokun_wake();
+						if (himax_raw_frames()) {
+							himax_sense_on();
+						}
+					} else if (rearms == 3) {
+						rearms++;
+						say_both("himax: three asks unanswered -- the touch will wait for a warmer boot\n");
+					}
+				}
+			}
 		}
 		sleep_us(poll_us);
 	}
