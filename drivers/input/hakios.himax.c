@@ -698,8 +698,16 @@ static bool (*spi_transfer)(const uint8_t *tx, uint8_t *rx, uint32_t length);
  * wrong: the vendor's own headers carry them for their scan; the answer on this board walks the
  * matrix the other way.
  */
-#define HIMAX_MAX_TX                    60              /* rows of the frame: the drive axis that spans the panel width */
-#define HIMAX_MAX_RX                    40              /* columns: the sense axis that spans its height */
+/*
+ * The vendor's own layout, read off their Windows driver (EGoTouchRev, FrameLayout.h): the
+ * matrix is FORTY drive rows of SIXTY sense columns, right after the frame header. What the
+ * taps of the last rounds "saw" as sixty was this sixty; the sixty as forty: the frame was
+ * walked the wrong way, and the last twenty rows were the status table's bytes taken as
+ * capacitance -- which is what drifted between boots, what answered the census with the wrong
+ * spread, and what made a whole axis look dead when it was only mis-counted.
+ */
+#define HIMAX_MAX_TX                    40              /* rows: the drive lines, kTxCount */
+#define HIMAX_MAX_RX                    60              /* columns: the sense lines, kRxCount */
 #define HIMAX_FRAME_OFF                 4               /* the vendor's OFST, from the start of the receive buffer */
 #define HIMAX_FRAME_BYTES               (2 * HIMAX_MAX_TX * HIMAX_MAX_RX)
 #define HIMAX_REPORT_BYTES              5132U   /* the vendor's FULL_STACK_SZ: header, matrix, and the arrays after it */
@@ -1012,18 +1020,25 @@ himax_gaokun_wake(void)
  * swap); -y is the forty-count axis, the columns (X below, feeding the panel's height). The names
  * keep the dts's letters for comparison with its numbers; the axes keep the truth the taps told.
  */
-#define X_TOTAL                 16000U                  /* the forty-line axis: the panel's height */
-#define Y_TOTAL                 25600U                  /* the sixty-line axis: the panel's width */
-#define X_SCALE                 9U
+/*
+ * The two dts totals named the axes the wrong way round (the note above this block is the
+ * truth, kept for its history). Now: the sixty-count columns span the panel's width, the
+ * forty-count rows its height; no fudge factors -- the vendor's layout leaves nothing to
+ * tune. Which end is zero is the one thing the taps still have to say, and the next
+ * five-point run will say it with the chip's own single-point numbers beside ours.
+ */
+#define X_TOTAL                 PANEL_X
+#define Y_TOTAL                 PANEL_Y
+#define X_SCALE                 1U
 #define Y_SCALE                 1U
+/* The panel, from gk3.dts's own framebuffer0. */
+#define PANEL_X                 1600U
+#define PANEL_Y                 2560U
+
 #define X_TOTAL_REV             (X_SCALE * X_TOTAL * (HIMAX_MAX_RX + 1) / HIMAX_MAX_RX)
 #define Y_TOTAL_REV             (Y_SCALE * Y_TOTAL * (HIMAX_MAX_TX + 1) / HIMAX_MAX_TX)
 #define DX                      (X_TOTAL_REV / HIMAX_MAX_RX)
 #define DY                      (Y_TOTAL_REV / HIMAX_MAX_TX)
-
-/* The panel, from gk3.dts's own framebuffer0. */
-#define PANEL_X                 1600U
-#define PANEL_Y                 2560U
 
 #define HIMAX_MAX_CONTACTS      5                       /* the task set: five fingers, no more */
 #define HIMAX_MAX_PEAKS         15                      /* a few candidates per finger is enough */
@@ -1065,6 +1080,16 @@ static uint32_t matrix_off;                    /* every frame says where; nothin
 static bool matrix_swapped;                    /* decided on the first frame: the order that sees more panels */
 static uint32_t matrix_nosync;                 /* answers with no recognizable frame start */
 static uint32_t matrix_torn;                   /* (kept for the statistics' history) whole-field-zero frames */
+/*
+ * The vendor's status table sits right after the matrix (their FrameLayout.h, read out of
+ * himax_thp_drv.dll with Ghidra). Two of its named words matter here: word 6 tells us the
+ * chip's firmware reset itself -- which is one way a field goes silent on us mid-session --
+ * and words 54/55 are the chip's OWN single-point coordinates (0xFF = no point there):
+ * a hardware oracle to set our matrix-computed numbers against.
+ */
+static uint32_t chip_selfresets;               /* times word 6 said the firmware reset itself */
+static uint16_t chip_x, chip_y;                /* the chip's own point, last it had one */
+static bool chip_point;                        /* it had one this frame */
 static uint32_t matrix_rest;
 
 /*
@@ -1195,6 +1220,21 @@ himax_anchor(void)
 		return false;
 	}
 	matrix_off = head_at + 2;   /* accepted on the signature: the maps of the last rounds were built on this rule; the whole-ness check added with the blocks was an over-correction -- it refused every frame on the assumption that a report ends quiet, but after the matrix come the tx and rx arrays, panel data themselves, never quiet */
+	/* the named words of the status table, if this report carries it (it normally does:
+	 * header + 4800 of matrix + 256 of table, under our window) */
+	chip_point = false;
+	if (matrix_off + HIMAX_FRAME_BYTES + 2u * 56u <= HIMAX_MAX_READ) {
+		const uint8_t *tbl = himax_rx + matrix_off + HIMAX_FRAME_BYTES;
+		if (le16(tbl + 12) != 0 && chip_selfresets++ == 0) {
+			say_both("himax: the chip says its firmware reset itself -- that is a silence explained\n");
+		}
+		uint16_t cx = le16(tbl + 108), cy = le16(tbl + 110);
+		if (cx != 0xFF && cy != 0xFF) {
+			chip_x = cx;
+			chip_y = cy;
+			chip_point = true;
+		}
+	}
 	for (int r = 0; r < HIMAX_MAX_TX; r++) {
 		row_byte[r] = matrix_off + (uint32_t)r * 2u * HIMAX_MAX_RX;
 	}
@@ -1693,8 +1733,11 @@ himax_report(unsigned count, const uint32_t *sx, const uint32_t *sy)
 		 * inverted here (the reading that matches the dts's letter); the next five taps will
 		 * confirm it or name the flip, and it is a one-line flip either way.
 		 */
-		uint32_t panel_x = (uint32_t)(((uint64_t)y * PANEL_X) / Y_TOTAL);
-		uint32_t panel_y = (uint32_t)(((uint64_t)(X_TOTAL - x) * PANEL_Y) / X_TOTAL);
+		/* the straight reading: the columns (sx) span the width, the rows (sy) the height,
+		 * both with the top-left as zero -- a first guess at the two directions, and the
+		 * five-point run plus the chip's own single-point words will pin them exactly. */
+		uint32_t panel_x = (uint32_t)(((uint64_t)x * PANEL_X) / X_TOTAL);
+		uint32_t panel_y = (uint32_t)(((uint64_t)y * PANEL_Y) / Y_TOTAL);
 
 		seen.touches++;
 		seen.last_x = panel_x;
@@ -1720,8 +1763,12 @@ himax_report(unsigned count, const uint32_t *sx, const uint32_t *sy)
 				/* the raw axis values too: a five-point calibration against KNOWN corners reads
 				 * these, not the guessed panel numbers -- which axis the touch really moved is
 				 * seen here, and the affine is then computed once, correctly, not retuned blind. */
-				say_both("himax: tap at %u, %u (of %u x %u); axis %u, %u (cells %u of %u, %u of %u)\n", panel_x, panel_y,
-				    PANEL_X, PANEL_Y, x, y, y / DY, HIMAX_MAX_TX, x / DX, HIMAX_MAX_RX);
+				say_both("himax: tap at %u, %u (of %u x %u); cells %u of %u, %u of %u; the chip says %s\n", panel_x, panel_y,
+				    PANEL_X, PANEL_Y, y / DY, HIMAX_MAX_TX, x / DX, HIMAX_MAX_RX,
+				    chip_point ? "" : "nothing");
+				if (chip_point) {
+					say_both("himax:   the chip's own point: %u, %u\n", chip_x, chip_y);
+				}
 			}
 			hakios_touch_post(HAKIOS_TOUCH_DOWN, best, post_x, post_y);
 		} else if (contact[best].x != panel_x || contact[best].y != panel_y) {
