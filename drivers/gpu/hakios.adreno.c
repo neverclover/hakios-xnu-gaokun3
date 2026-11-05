@@ -1570,6 +1570,15 @@ space_off(struct gpu_space *space, uint32_t match)
 #define SCM_VALUE_AND_BUFFER    (2 | 2 << 6)            /* two: a number, and the address of memory it may read and write */
 #define SCM_INTERRUPTED         1                       /* a call that was preempted says so, and is made again so */
 #define PAS_GPU                 13
+/*
+ * QTEE answers with an error of its own from a base of 0x300000. A machine that booted from
+ * another firmware before this one already has its signed shader in TrustZone (a Windows start
+ * keeps the GPU firmware up, and this boot did not cut the power), and the full load (step 19)
+ * treats a refusal there as exactly that: it keeps the shader and goes on. The standalone probe
+ * here (step 12) cannot decide that question -- the 3D core has no power yet -- so a QTEE error
+ * here is said by its number and let through, not taken as an end.
+ */
+static int32_t gTZAnswer;
 
 /* One call. What TrustZone returns: 0 or an error of its own, and a word of answer. */
 static int32_t
@@ -1597,6 +1606,7 @@ scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uin
 		session = x6;
 		if (x0 != SCM_INTERRUPTED) {
 			printf("adreno: %u: TrustZone returns %d, answer %#llx\n", step, (int32_t)x0, x1);
+			gTZAnswer = (int32_t)x0;
 			*answer = x1;
 			return (int32_t)x0;
 		}
@@ -1775,6 +1785,15 @@ step_zap_signature(void)
 	    header, 0, &answer);
 	if (result == 0 && answer == 0) {
 		printf("adreno: %u: TRUSTZONE ACCEPTS THE ZAP SHADER'S SIGNATURE FROM THIS KERNEL\n", step);
+		return true;
+	}
+	/* A QTEE error of its own means the call was understood and answered, which is the warm-boot
+	 * case step 19 is written to handle: a signed shader already in TrustZone from the firmware
+	 * before this one. This probe, before the core has power, cannot decide that; say the number
+	 * and let the walk reach the step that can. */
+	if (result < -0x300000 && result != -1 && answer == 0) {
+		printf("adreno: %u: TrustZone refuses this header with its error %d (%#x); a machine that came from another "
+		    "firmware may hold a signed shader already -- decided at the full load, not here\n", step, result, -result);
 		return true;
 	}
 	printf("adreno: %u: TrustZone does not take it: the call returns %d, its answer is %#llx\n", step, result, answer);
