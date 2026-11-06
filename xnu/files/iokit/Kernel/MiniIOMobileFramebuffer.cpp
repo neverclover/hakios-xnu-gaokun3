@@ -382,7 +382,11 @@ public:
 	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
 	void drawRows(const struct RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow);
 	void drawTurned(MiniIOSurface * s, int32_t sx, int32_t sy, int32_t dx, int32_t dy, int32_t dw, int32_t dh);
-	uint32_t fTurnSaid = 0;         /* the fbrotate rectangle lines, told twice */
+	uint32_t fTurnSaid = 0;         /* the fbrotate rectangle lines, told thrice */
+	uint64_t fTurnDone = 0;         /* rectangles that went through the turn */
+	uint64_t fTurnOld = 0;          /* and the ones the guard sent the scaled way */
+	int32_t  fTurnBad[8] = { 0 };   /* the last refused rect, for the ledger */
+	uint32_t fTurnBadW = 0, fTurnBadH = 0;
 	static void helperMain(void * self, wait_result_t result);
 	/* the scaling shared out (fb_threads): fThreads drawers, the presenter and fThreads - 1 helpers */
 	unsigned        fThreads;
@@ -885,11 +889,12 @@ IOMobileFramebuffer::drawTurned(MiniIOSurface * s, int32_t sx, int32_t sy, int32
 	const uint32_t cw = fWidth, ch = fHeight;          /* the canvas: ch rows of cw, landscape */
 	const bool turn90 = gFBRotate == 90;
 
+	fTurnDone++;
 	/* the panel rectangle the asked-for canvas rectangle lands on */
 	int64_t qx0, qx1, qy0, qy1;
 
 	if (turn90) {
-		/* canvas (U,V) stands at panel (x = ch-1-V, y = U): the top edge along the panel's left */
+		/* canvas (U,V) stands at panel (x = ch-1-V, y = U): the top edge lands along the panel's RIGHT short edge */
 		qx0 = (int64_t) ch - (dy + dh);
 		qx1 = (int64_t) ch - dy;
 		qy0 = dx;
@@ -960,19 +965,28 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	 * of only the full frame was (the window server is not obliged to send one).
 	 */
 	if (gFBRotate == 90 || gFBRotate == 270) {
+		const bool turns = fWidth == fPanelHeight && fHeight == fPanelWidth && dw == sw && dh == sh;
+
 		if (fTurnSaid < 3) {
 			IOLog("MiniIOMobileFramebuffer: fbrotate=%u: surface %ux%u (%u B/row, %u planes), src %d %d %d %d, dst %d %d %d %d, turned=%s\n",
 			    gFBRotate, (uint32_t) s->info.width, (uint32_t) s->info.height, s->info.bytesPerRow,
-			    (uint32_t) s->info.planeCount, sx, sy, sw, sh, dx, dy, dw, dh,
-			    (fWidth == fPanelHeight && fHeight == fPanelWidth && dw == sw && dh == sh) ? "yes" : "no");
+			    (uint32_t) s->info.planeCount, sx, sy, sw, sh, dx, dy, dw, dh, turns ? "yes" : "no");
 			fTurnSaid++;
 		}
-	}
-	if ((gFBRotate == 90 || gFBRotate == 270) && fWidth == fPanelHeight && fHeight == fPanelWidth &&
-	    dw == sw && dh == sh) {
-		drawTurned(s, sx, sy, dx, dy, dw, dh);
+		if (!turns) {
+			/* the ones that walk past into the scaled path: keep the LAST one's numbers --
+			 * the five-second ledger below repeats them, because the ring buries the early lines */
+			fTurnOld++;
+			fTurnBad[0] = sx; fTurnBad[1] = sy; fTurnBad[2] = sw; fTurnBad[3] = sh;
+			fTurnBad[4] = dx; fTurnBad[5] = dy; fTurnBad[6] = dw; fTurnBad[7] = dh;
+			fTurnBadW = (uint32_t) s->info.width;
+			fTurnBadH = (uint32_t) s->info.height;
+		}
+		if (turns) {
+			drawTurned(s, sx, sy, dx, dy, dw, dh);
 
-		return;
+			return;
+		}
 	}
 	/*
 	 * the rectangle on the panel, worked out in 64 bits: the request's numbers are the caller's, and a
@@ -1415,6 +1429,15 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			fDiffPixels = 0;
 			fDiffLeft = fDiffTop = ~0u;
 			fDiffRight = fDiffBottom = 0;
+		}
+		if ((gFBRotate == 90 || gFBRotate == 270) && (fTurnDone != 0 || fTurnOld != 0)) {
+			IOLog("MiniIOMobileFramebuffer: fbrotate=%u: canvas %ux%u on a panel of %ux%u: %u turned"
+			    "%s, %u the scaled way%s\n", gFBRotate, fWidth, fHeight, fPanelWidth, fPanelHeight,
+			    fTurnDone, fTurnOld != 0 ? " rectangles" : "",
+			    fTurnOld, fTurnOld != 0 ? (", last refused: surface %ux%u src %d %d %d %d dst %d %d %d %d",
+			      fTurnBadW, fTurnBadH, fTurnBad[0], fTurnBad[1], fTurnBad[2], fTurnBad[3],
+			      fTurnBad[4], fTurnBad[5], fTurnBad[6], fTurnBad[7]) : "");
+			fTurnDone = fTurnOld = 0;
 		}
 		fStatFrames = 0;
 		fStatDrawing = 0;
