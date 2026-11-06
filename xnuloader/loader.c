@@ -316,6 +316,8 @@ static uint8_t log_verify[sizeof(out_buf) + 8192] __attribute__((aligned(0x2000)
 static const char *staged_data = out_buf;   /* what "upload" sends: normally the log in out_buf */
 static uint64_t staged_len;
 
+static uint64_t *gaokun_board;   /* PA of the XNULDRST slot, remembered at patch time */
+
 static void
 compose_logs(const char *klog, uint64_t klog_len)
 {
@@ -352,6 +354,10 @@ write_logs(const char *klog, uint64_t klog_len)
 	compose_logs(klog, klog_len);
 	if (bio == NULL) {
 		/* No log partition (QEMU): echo the returned kernel log on the console instead. */
+		if (gaokun_board != NULL && gaokun_board[4] != 0) {
+			print("\n== GAOKUN BOARD ==\nmarker %x esr %x far %x elr %x count %x\n",
+				gaokun_board[4], gaokun_board[5], gaokun_board[6], gaokun_board[7], gaokun_board[8]);
+		}
 		if (klog != NULL) {
 			print("\n== KERNEL LOG ==\n");
 			for (uint64_t i = 0; i < klog_len; i++) {
@@ -2809,6 +2815,16 @@ set_result(const char *what, uint64_t a, uint64_t b)
 }
 
 /* Every range of the firmware's memory map of 1 MB or more, and the total of each type. */
+/* splitmix64: small, well-tested, and honest about being a spreader, not a source of entropy */
+static uint64_t
+seed_mix(uint64_t z)
+{
+	z += 0x9e3779b97f4a7c15ULL;
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+	z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+	return z ^ (z >> 31);
+}
+
 static void
 print_memory_map(void)
 {
@@ -3180,6 +3196,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			q[2] = checkpoint;
 			q[3] = slide;
 			print("return slot patched at %x, checkpoint %d\n", (uint64_t)(uintptr_t)q, checkpoint);
+			gaokun_board = q;   /* the quads after the slot are the kernel's mute reporting board */
 			break;
 		}
 	}
@@ -3318,10 +3335,15 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	uint64_t cntfrq = READ_SYSREG(CNTFRQ_EL0);
 	uint64_t ranges[3] = { 0, plat->io_base, plat->io_size };
 	uint64_t reg2[2];
-	uint8_t seed[64];
-
-	for (unsigned i = 0; i < sizeof(seed); i++) {
-		seed[i] = (uint8_t)(READ_SYSREG(CNTVCT_EL0) >> (i & 7)) ^ (uint8_t)(i * 37);
+	uint8_t seed[256];   /* the 26-generation kernel requires 256; the 22-generation one asks for
+	 * less and gets what it asks. The seed is a counter in a known position; spread it with a
+	 * mixing function so any window of it differs from any other in most of its bits. */
+	uint64_t counter = READ_SYSREG(CNTVCT_EL0);
+	for (unsigned i = 0; i < sizeof(seed); ) {
+		counter = seed_mix(counter + i);
+		for (unsigned byte = 0; byte < 8 && i < sizeof(seed); byte++, i++) {
+			seed[i] = (uint8_t)(counter >> (byte * 8));
+		}
 	}
 
 	dt_begin(&w, "device-tree");
@@ -4290,6 +4312,7 @@ ramfb_phone_screen(void)
  * (docs/uefi-boot.md says what does).
  */
 static uint64_t volume_payload_bytes;           /* 0: nothing was read; else the payload's size */
+static int payload_chosen_next;           /* which of the two the loader picked */
 static const char *volume_payload_note;         /* why not, if it was looked for */
 
 static int
@@ -4298,6 +4321,8 @@ load_payload_from_volume(void)
 	static const efi_guid image_guid = EFI_LOADED_IMAGE_GUID, fs_guid = EFI_SIMPLE_FILE_SYSTEM_GUID,
 	    info_guid = EFI_FILE_INFO_GUID;
 	static const char16 path[] = u"\\EFI\\hakios\\payload.bin";
+	static const char16 next_path[] = u"\\EFI\\hakios\\payload-next.bin";   /* a newer kernel, tried first when present */
+
 	efi_loaded_image *image = NULL;
 	efi_simple_fs *fs = NULL;
 	efi_file *root = NULL, *file = NULL;
@@ -4314,10 +4339,16 @@ load_payload_from_volume(void)
 		volume_payload_note = "the volume cannot be opened";
 		return 0;
 	}
-	if (EFI_ERROR(root->open(root, &file, path, EFI_FILE_MODE_READ, 0)) || file == NULL) {
-		volume_payload_note = "there is no \\EFI\\hakios\\payload.bin on the volume";
-		root->close(root);
-		return 0;
+	if (EFI_ERROR(root->open(root, &file, next_path, EFI_FILE_MODE_READ, 0)) || file == NULL) {
+		file = NULL;
+		if (EFI_ERROR(root->open(root, &file, path, EFI_FILE_MODE_READ, 0)) || file == NULL) {
+			volume_payload_note = "there is no payload (nor payload-next) on the volume";
+			root->close(root);
+			return 0;
+		}
+		payload_chosen_next = 0;
+	} else {
+		payload_chosen_next = 1;
 	}
 	if (EFI_ERROR(file->get_info(file, &info_guid, &info_size, info))) {
 		volume_payload_note = "the size of \\EFI\\hakios\\payload.bin cannot be read";
@@ -4518,8 +4549,8 @@ efi_main(efi_handle image, efi_system_table *st)
 	print("== XNULOADER v3 ==\n");
 	print_banner();
 	if (volume_payload_bytes != 0) {
-		print("payload: %d bytes from \\EFI\\hakios\\payload.bin on the volume this loader was started from\n",
-		    volume_payload_bytes);
+		print("payload: %d bytes from \\EFI\\hakios\\%s on the volume this loader was started from\n",
+		    volume_payload_bytes, payload_chosen_next ? "payload-next.bin" : "payload.bin");
 	} else if (volume_payload_note != NULL) {
 		print("payload: none in memory, and %s\n", volume_payload_note);
 	}
