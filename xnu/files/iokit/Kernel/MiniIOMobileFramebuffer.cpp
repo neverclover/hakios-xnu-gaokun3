@@ -561,6 +561,17 @@ IOMobileFramebuffer::start(IOService * provider)
 			}
 		}
 	}
+	if (gFBRotate == 90 || gFBRotate == 270) {
+		/* the courtesy iBoot extends on a panel mounted turned: name the disagreement where
+		 * the display stack always reads. The driver's copy answers the turn -- nobody else
+		 * is asked to; the property says why the picture and the panel are cut differently. */
+		IORegistryEntry * node = IORegistryEntry::fromPath("/chosen", gIODTPlane);
+
+		if (node != NULL) {
+			node->setProperty("display-rotation", &gFBRotate, sizeof(gFBRotate));
+			node->release();
+		}
+	}
 	fColumn = IONewZero(uint32_t, fPanelWidth);
 	fColumnWeight = IONewZero(uint16_t, fPanelWidth);
 	fDiff = gDiff != 0;
@@ -1648,6 +1659,17 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		out[0] = fOwner->fWidth;
 		out[1] = fOwner->fHeight;
 		args->scalarOutputCount = 2;
+		return kIOReturnSuccess;
+
+	case kFBMethodGetDisplayArea:                  /* out: x, y, width, height */
+		if (args->scalarOutputCount < 4) {
+			return kIOReturnBadArgument;
+		}
+		out[0] = 0;
+		out[1] = 0;
+		out[2] = fOwner->fWidth;
+		out[3] = fOwner->fHeight;
+		args->scalarOutputCount = 4;
 		return kIOReturnSuccess;
 
 	case kFBMethodGetID:
