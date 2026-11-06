@@ -79,6 +79,7 @@ cam_shutter	k
 cam_vblank	k
 cc_fade	u
 cpufreq	k
+cpufreq_domains	k
 cpuload	k
 cpumask	l
 cpus	l
@@ -97,6 +98,7 @@ fb_pri	k
 fb_queue	k
 fb_threads	k
 fbheight	k
+fbrotate	k
 fbscale	k
 fbtrace	k
 fbwidth	k
@@ -145,6 +147,7 @@ gpu_log	k
 hakios_kver	k
 haptic	k
 haptic_effect	k
+himax_stop	k
 hv_wdt_pet	k
 loader_return_after	kl
 machine_name	k
