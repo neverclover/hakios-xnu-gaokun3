@@ -4316,7 +4316,7 @@ static int payload_chosen_next;           /* which of the two the loader picked 
 static const char *volume_payload_note;         /* why not, if it was looked for */
 
 static int
-load_payload_from_volume(void)
+load_payload_from_volume(int want_next)   /* want_next: prefer the experimental payload-next.bin */
 {
 	static const efi_guid image_guid = EFI_LOADED_IMAGE_GUID, fs_guid = EFI_SIMPLE_FILE_SYSTEM_GUID,
 	    info_guid = EFI_FILE_INFO_GUID;
@@ -4339,7 +4339,9 @@ load_payload_from_volume(void)
 		volume_payload_note = "the volume cannot be opened";
 		return 0;
 	}
-	if (EFI_ERROR(root->open(root, &file, next_path, EFI_FILE_MODE_READ, 0)) || file == NULL) {
+	if (want_next && !EFI_ERROR(root->open(root, &file, next_path, EFI_FILE_MODE_READ, 0)) && file != NULL) {
+		payload_chosen_next = 1;
+	} else {
 		file = NULL;
 		if (EFI_ERROR(root->open(root, &file, path, EFI_FILE_MODE_READ, 0)) || file == NULL) {
 			volume_payload_note = "there is no payload (nor payload-next) on the volume";
@@ -4347,8 +4349,6 @@ load_payload_from_volume(void)
 			return 0;
 		}
 		payload_chosen_next = 0;
-	} else {
-		payload_chosen_next = 1;
 	}
 	if (EFI_ERROR(file->get_info(file, &info_guid, &info_size, info))) {
 		volume_payload_note = "the size of \\EFI\\hakios\\payload.bin cannot be read";
@@ -4544,7 +4544,7 @@ efi_main(efi_handle image, efi_system_table *st)
 	BS->set_watchdog_timer(0, 0, 0, NULL);
 	/* no payload in memory (nobody put one there): the volume this loader came from may have one, as a UEFI boot loader's does */
 	if (((const struct payload_header *)PAYLOAD_BASE)->magic != PAYLOAD_MAGIC) {
-		load_payload_from_volume();
+		load_payload_from_volume(1);
 	}
 	print("== XNULOADER v3 ==\n");
 	print_banner();
@@ -4623,6 +4623,18 @@ efi_main(efi_handle image, efi_system_table *st)
 	/* One-shot mode: run the kernel that came with the image, then reset. */
 	if (have_payload) {
 		run_kernel(0, 0);
+		/*
+		 * When what came back was the experimental newer payload, do not stand by and reset into it
+		 * again: load the payload that is known to boot this machine and run that, in the same boot
+		 * services we still have (the same way the fastboot "oem run" loop runs kernels one after
+		 * another). One power press ends at a usable system; the experiment gets tried once per boot.
+		 */
+		if (payload_chosen_next) {
+			print("the newer payload came back: booting the usual payload now\n");
+			if (load_payload_from_volume(0) && parse_payload(&pi, 0)) {
+				run_kernel(0, 0);
+			}
+		}
 	}
 	reboot();
 	return 0;
