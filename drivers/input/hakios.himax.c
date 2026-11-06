@@ -709,6 +709,43 @@ static bool (*spi_transfer)(const uint8_t *tx, uint8_t *rx, uint32_t length);
 #define HIMAX_MAX_TX                    40              /* rows: the drive lines, kTxCount */
 #define HIMAX_MAX_RX                    60              /* columns: the sense lines, kRxCount */
 #define HIMAX_FRAME_OFF                 4               /* the vendor's OFST, from the start of the receive buffer */
+
+/*
+ * fbrotate lives with the display driver: when the picture is drawn landscape on this portrait
+ * panel, the finger must speak the picture's language too. One argument for both sides --
+ * the same turn, read once, applied only on the way out (the analysis, the taps, the cells:
+ * all of it stays in the panel's and the chip's own coordinates).
+ */
+static uint32_t
+fbrotate_taken(void)
+{
+	static uint32_t rot = 0xFFFFFFFF;                 /* not looked at yet */
+
+	if (rot == 0xFFFFFFFF) {
+		uint32_t v = 0;
+
+		PE_parse_boot_argn("fbrotate", &v, sizeof(v));
+		rot = (v == 90 || v == 270) ? v : 0;
+	}
+
+	return rot;
+}
+
+static void
+touch_turn(uint32_t *x, uint32_t *y)
+{
+	const uint32_t rot = fbrotate_taken();
+
+	if (rot == 90) {
+		uint32_t nx = *y, ny = 65535u - *x;
+
+		*x = nx; *y = ny;
+	} else if (rot == 270) {
+		uint32_t nx = 65535u - *y, ny = *x;
+
+		*x = nx; *y = ny;
+	}
+}
 #define HIMAX_FRAME_BYTES               (2 * HIMAX_MAX_TX * HIMAX_MAX_RX)
 #define HIMAX_REPORT_BYTES              5132U   /* the vendor's FULL_STACK_SZ: header, matrix, and the arrays after it */
 
@@ -1937,11 +1974,13 @@ himax_report(unsigned count, const uint32_t *sx, const uint32_t *sy)
 					say_both("himax:   the chip's own point: %u, %u\n", chip_x, chip_y);
 				}
 			}
+			touch_turn(&post_x, &post_y);
 			hakios_touch_post(HAKIOS_TOUCH_DOWN, best, post_x, post_y);
 		} else if (contact[best].x != panel_x || contact[best].y != panel_y) {
 			uint32_t run_x = panel_x > contact[best].dx0 ? panel_x - contact[best].dx0 : contact[best].dx0 - panel_x;
 			uint32_t run_y = panel_y > contact[best].dy0 ? panel_y - contact[best].dy0 : contact[best].dy0 - panel_y;
 
+			touch_turn(&post_x, &post_y);
 			hakios_touch_post(HAKIOS_TOUCH_MOVE, best, post_x, post_y);
 			seen.moves++;
 			if (run_x + run_y > seen.trackmax) {
@@ -1970,8 +2009,10 @@ himax_report(unsigned count, const uint32_t *sx, const uint32_t *sy)
 			contact[id].down = false;
 			contact[id].off = 0;
 			contact[id].pend = false;
-			hakios_touch_post(HAKIOS_TOUCH_UP, id, mult_frac(contact[id].x, 65535, PANEL_X - 1),
-			    mult_frac(contact[id].y, 65535, PANEL_Y - 1));
+			uint32_t up_x = mult_frac(contact[id].x, 65535, PANEL_X - 1), up_y = mult_frac(contact[id].y, 65535, PANEL_Y - 1);
+
+			touch_turn(&up_x, &up_y);
+			hakios_touch_post(HAKIOS_TOUCH_UP, id, up_x, up_y);
 		}
 	}
 }

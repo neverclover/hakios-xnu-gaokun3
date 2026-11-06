@@ -105,6 +105,10 @@ static uint8_t  gFBCalls[128];          /* how many calls of each selector were 
 
 static TUNABLE(uint32_t, gFBWidth, "fbwidth", kFBDefaultWidth);
 static TUNABLE(uint32_t, gFBHeight, "fbheight", kFBDefaultHeight);
+/* fbrotate=90/270: the picture is drawn landscape and this driver turns it for a portrait panel.
+ * Windows does the same turn with the GPU's compositor; there is no GPU here, so the turn is a
+ * copy -- and the copy is the one a swap already does through these hands (drawRows). */
+static TUNABLE(uint32_t, gFBRotate, "fbrotate", 0);
 /*
  * Boot-arg fbscale=2: the same 375 x 812 points drawn at two pixels a point instead of three.
  * Everything that is drawn is drawn by the processor, and this is 2.25 times fewer pixels to
@@ -377,6 +381,7 @@ public:
 	void reportFrameTimes(void);
 	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
 	void drawRows(const struct RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow);
+	void drawRotated(MiniIOSurface * s);
 	static void helperMain(void * self, wait_result_t result);
 	/* the scaling shared out (fb_threads): fThreads drawers, the presenter and fThreads - 1 helpers */
 	unsigned        fThreads;
@@ -861,6 +866,46 @@ IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
  * step, bilinear (or nearest neighbour: fb_filter=0).
  */
 void
+/*
+ * The rotation itself. It reads one column of the picture while writing one row of the panel:
+ * straight through, that is a cache miss per pixel. In blocks of ROT_TILE both sides of a block
+ * stay within reach of the caches, and the frame costs milliseconds -- the same order as the
+ * scaled copy the swap already pays (some 9 ms), with the same one write per pixel.
+ */
+#define ROT_TILE 32
+
+void
+IOMobileFramebuffer::drawRotated(MiniIOSurface * s)
+{
+	const uint32_t *pixels = (const uint32_t *) s->pixels();
+	const uint32_t stride = s->info.bytesPerRow / 4;
+	const uint32_t cw = fWidth, ch = fHeight;          /* the canvas: ch rows of cw */
+	const bool turn90 = gFBRotate == 90;
+
+	for (uint32_t by = 0; by < fPanelHeight; by += ROT_TILE) {
+		for (uint32_t bx = 0; bx < fPanelWidth; bx += ROT_TILE) {
+			const uint32_t ey = by + ROT_TILE < fPanelHeight ? by + ROT_TILE : fPanelHeight;
+			const uint32_t ex = bx + ROT_TILE < fPanelWidth ? bx + ROT_TILE : fPanelWidth;
+
+			for (uint32_t y = by; y < ey; y++) {
+				uint32_t *to = (uint32_t *) (fBase + (size_t) y * fRowBytes);
+
+				if (turn90) {
+					/* the top of the picture stands along the panel's LEFT short edge */
+					for (uint32_t x = bx; x < ex; x++) {
+						to[x] = pixels[(size_t) (ch - 1 - x) * stride + y];
+					}
+				} else {
+					/* ... and along its RIGHT one */
+					for (uint32_t x = bx; x < ex; x++) {
+						to[x] = pixels[(size_t) x * stride + (cw - 1 - y)];
+					}
+				}
+			}
+		}
+	}
+}
+
 IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst)
 {
 	int32_t sx = src[0], sy = src[1], sw = src[2], sh = src[3];
@@ -884,6 +929,19 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	}
 	/* the rows and columns named must be in the surface's memory, whatever stride and size it was made with */
 	if (!surfaceHolds(s, (uint32_t) (sy + sh), (uint32_t) (sx + sw))) {
+		return;
+	}
+	/*
+	 * fbrotate: the ordinary full-frame swap -- one layer, the whole canvas, painted where the
+	 * canvas is -- goes through the rotation. Nothing else does: a rotated PART would need its
+	 * panel rectangle turned around too, and the desktop only ever sends the whole frame.
+	 */
+	if ((gFBRotate == 90 || gFBRotate == 270) && fWidth == fPanelHeight && fHeight == fPanelWidth &&
+	    (uint32_t) sw == s->info.width && (uint32_t) sh == s->info.height &&
+	    (int32_t) s->info.width == (int32_t) fWidth && (int32_t) s->info.height == (int32_t) fHeight &&
+	    dx == 0 && dy == 0 && dw == (int32_t) fWidth && dh == (int32_t) fHeight) {
+		drawRotated(s);
+
 		return;
 	}
 	/*
