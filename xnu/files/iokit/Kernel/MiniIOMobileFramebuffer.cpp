@@ -372,6 +372,7 @@ public:
 	uint32_t        fRecCosted;             /* ... of how many frames: a line every 120 */
 
 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
+	bool handleOpen(IOService * forClient, IOOptionBits options, void * arg) APPLE_KEXT_OVERRIDE;
 	void publishModes(void);
 	void publishRefresh(void);
 	MiniIOSurface * defaultSurface(void);
@@ -514,6 +515,7 @@ IOMobileFramebuffer::start(IOService * provider)
 	thread_t thread;
 
 	if (!IOService::start(provider)) {
+		loader_status("display: the driver started, but the bus said no\n");
 		return false;
 	}
 	if (vinfo.v_baseaddr == 0 || vinfo.v_width == 0 || vinfo.v_height == 0 || vinfo.v_depth != 32) {
@@ -581,8 +583,9 @@ IOMobileFramebuffer::start(IOService * provider)
 	fDiffLeft = fDiffTop = ~0u;
 	IOLog("MiniIOMobileFramebuffer: display %ux%u on a panel of %ux%u (%u bytes per row)\n", fWidth, fHeight,
 	    fPanelWidth, fPanelHeight, fRowBytes);
-	loader_status("display: canvas %ux%u on a panel of %ux%u, fbrotate=%u\n", fWidth, fHeight,
-	    fPanelWidth, fPanelHeight, gFBRotate);
+	loader_status("display: canvas %ux%u on a panel of %ux%u, fbrotate=%u%s\n", fWidth, fHeight,
+	    fPanelWidth, fPanelHeight, gFBRotate,
+	    (fWidth == fPanelWidth && fHeight == fPanelHeight) ? " (declared only: the stack turns it or not)" : "");
 
 	if (gRecSeconds != 0) {
 		/* one piece of physical memory: the loader will send it over USB as it lies */
@@ -886,7 +889,6 @@ IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
  * panel may be of another size, and the layer itself may be scaled: both are done in one
  * step, bilinear (or nearest neighbour: fb_filter=0).
  */
-void
 /*
  * The turn itself, for one un-scaled rectangle of the canvas at (dx,dy), taken from the
  * surface at (sx,sy). The panel rectangle of a rotated canvas rectangle is that rectangle
@@ -952,6 +954,7 @@ IOMobileFramebuffer::drawTurned(MiniIOSurface * s, int32_t sx, int32_t sy, int32
 	}
 }
 
+void
 IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst)
 {
 	int32_t sx = src[0], sy = src[1], sw = src[2], sh = src[3];
@@ -1454,12 +1457,16 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			fDiffRight = fDiffBottom = 0;
 		}
 		if ((gFBRotate == 90 || gFBRotate == 270) && (fTurnDone != 0 || fTurnOld != 0)) {
-			IOLog("MiniIOMobileFramebuffer: fbrotate=%u: canvas %ux%u on a panel of %ux%u: %u turned"
-			    "%s, %u the scaled way%s\n", gFBRotate, fWidth, fHeight, fPanelWidth, fPanelHeight,
-			    fTurnDone, fTurnOld != 0 ? " rectangles" : "",
-			    fTurnOld, fTurnOld != 0 ? (", last refused: surface %ux%u src %d %d %d %d dst %d %d %d %d",
-			      fTurnBadW, fTurnBadH, fTurnBad[0], fTurnBad[1], fTurnBad[2], fTurnBad[3],
-			      fTurnBad[4], fTurnBad[5], fTurnBad[6], fTurnBad[7]) : "");
+			if (fTurnOld != 0) {
+				IOLog("MiniIOMobileFramebuffer: fbrotate=%u: canvas %ux%u on a panel of %ux%u: %u turned, "
+				    "%u the scaled way (last refused: surface %ux%u src %d %d %d %d dst %d %d %d %d)\n",
+				    gFBRotate, fWidth, fHeight, fPanelWidth, fPanelHeight, fTurnDone, fTurnOld,
+				    fTurnBadW, fTurnBadH, fTurnBad[0], fTurnBad[1], fTurnBad[2], fTurnBad[3],
+				    fTurnBad[4], fTurnBad[5], fTurnBad[6], fTurnBad[7]);
+			} else {
+				IOLog("MiniIOMobileFramebuffer: fbrotate=%u: canvas %ux%u on a panel of %ux%u: %u turned\n",
+				    gFBRotate, fWidth, fHeight, fPanelWidth, fPanelHeight, fTurnDone);
+			}
 			fTurnDone = fTurnOld = 0;
 		}
 		fStatFrames = 0;
@@ -1510,6 +1517,14 @@ IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void * securityID
 		return false;
 	}
 	fTask = owningTask;
+	return true;
+}
+
+/* is this driver opened by anything in userland? the first time, say so where the notes are read */
+bool
+IOMobileFramebuffer::handleOpen(IOService * forClient, IOOptionBits options, void * arg)
+{
+	loader_status("display: userland opened the framebuffer (the first one)\n");
 	return true;
 }
 
@@ -1661,6 +1676,16 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		    args->scalarInputCount > 0 ? in[0] : 0, args->scalarInputCount > 1 ? in[1] : 0,
 		    args->scalarInputCount > 2 ? in[2] : 0, args->scalarInputCount > 3 ? in[3] : 0, args->scalarOutputCount,
 		    args->structureInputSize, args->structureOutputSize);
+	}
+
+	/* the first time userland asks each question: what it was, and what we answer. The long
+	 * standing puzzle -- a landscape desktop arriving as the panel's portrait -- can only be
+	 * solved by knowing which questions the display stack actually asks this driver. */
+	static uint64_t seen;
+	if ((selector < 64) && !((seen >> selector) & 1ULL)) {
+		seen |= 1ULL << selector;
+		IOLog("MiniIOMobileFramebuffer: userland asks #%u (in: %u args, out space %u)\n", selector,
+		    args->scalarInputCount, args->structureOutputSize);
 	}
 
 	switch (selector) {

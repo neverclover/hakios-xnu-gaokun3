@@ -73,6 +73,7 @@ images:
 
 kernel:
 	[ -d xnu-src/xnu-8796.121.2 ] || xnu/apply.sh
+	xnu/sync-files.sh
 	[ -e xnu-deps/host/bin/ld64 ] || xnu-deps/setup.sh
 	tools/make-kernel.sh -j$(JOBS)
 
