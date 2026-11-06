@@ -30,7 +30,10 @@
 
 extern "C" {
 #include <console/video_console.h>
-extern struct vc_info vinfo;            /* the boot framebuffer, as the text console knows it */
+extern struct vc_info vinfo;
+/* the loader's "drivers' own notes": the short list it repeats in every heartbeat and every
+ * export -- the one place a line cannot be buried by the ring */
+extern "C" void loader_status(const char *fmt, ...) __printflike(1, 2);            /* the boot framebuffer, as the text console knows it */
 }
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -578,6 +581,8 @@ IOMobileFramebuffer::start(IOService * provider)
 	fDiffLeft = fDiffTop = ~0u;
 	IOLog("MiniIOMobileFramebuffer: display %ux%u on a panel of %ux%u (%u bytes per row)\n", fWidth, fHeight,
 	    fPanelWidth, fPanelHeight, fRowBytes);
+	loader_status("display: canvas %ux%u on a panel of %ux%u, fbrotate=%u\n", fWidth, fHeight,
+	    fPanelWidth, fPanelHeight, gFBRotate);
 
 	if (gRecSeconds != 0) {
 		/* one piece of physical memory: the loader will send it over USB as it lies */
@@ -900,6 +905,9 @@ IOMobileFramebuffer::drawTurned(MiniIOSurface * s, int32_t sx, int32_t sy, int32
 	const uint32_t cw = fWidth, ch = fHeight;          /* the canvas: ch rows of cw, landscape */
 	const bool turn90 = gFBRotate == 90;
 
+	if (fTurnDone == 0) {
+		loader_status("display: fbrotate is turning the frames (canvas %ux%u onto the panel)\n", fWidth, fHeight);
+	}
 	fTurnDone++;
 	/* the panel rectangle the asked-for canvas rectangle lands on */
 	int64_t qx0, qx1, qy0, qy1;
@@ -987,6 +995,10 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 		if (!turns) {
 			/* the ones that walk past into the scaled path: keep the LAST one's numbers --
 			 * the five-second ledger below repeats them, because the ring buries the early lines */
+			if (fTurnOld == 0) {
+				loader_status("display: fbrotate refused the first rect: surface %ux%u src %d %d %d %d dst %d %d %d %d\n",
+				    (uint32_t) s->info.width, (uint32_t) s->info.height, sx, sy, sw, sh, dx, dy, dw, dh);
+			}
 			fTurnOld++;
 			fTurnBad[0] = sx; fTurnBad[1] = sy; fTurnBad[2] = sw; fTurnBad[3] = sh;
 			fTurnBad[4] = dx; fTurnBad[5] = dy; fTurnBad[6] = dw; fTurnBad[7] = dh;
