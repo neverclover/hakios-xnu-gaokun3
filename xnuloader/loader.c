@@ -4525,6 +4525,16 @@ efi_main(efi_handle image, efi_system_table *st)
 	}
 	print("CurrentEL=%x MIDR=%x MMFR0=%x CNTFRQ=%d image=%x\n", READ_SYSREG(CurrentEL) >> 2, READ_SYSREG(MIDR_EL1),
 	    READ_SYSREG(ID_AA64MMFR0_EL1), READ_SYSREG(CNTFRQ_EL0), (uint64_t)(uintptr_t)&__ImageBase);
+	/* the one question a newer generation cannot walk around: iOS 26's userland is arm64e,
+	 * and arm64e needs the CPU to implement pointer authentication (ARMv8.3). The Xiaomi 15's
+	 * Oryon cores have it in hardware; whether the MateBook's X1c/A78c do is not written in
+	 * any of Huawei's tables -- so ask the chip itself, once, and keep the answer. */
+	const uint64_t isar1 = READ_SYSREG(ID_AA64ISAR1_EL1);
+	print("PAC: ISAR1=%x APA=%x API=%x GPA=%x -> %s\n", isar1,
+	    (unsigned int)((isar1 >> 0) & 0xf), (unsigned int)((isar1 >> 16) & 0xf),
+	    (unsigned int)((isar1 >> 4) & 0xf),
+	    ((((isar1 >> 0) & 0xf) || ((isar1 >> 16) & 0xf)) ? "hardware PAC: arm64e userland is a porting question"
+	                                                       : "no PAC: arm64e userland cannot run here"));
 
 	PLAT = &platform_qemu_virt;
 	/* a disk that says what machine it is for wins over any address matching (see above) */
