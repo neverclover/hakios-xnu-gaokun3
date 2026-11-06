@@ -381,7 +381,8 @@ public:
 	void reportFrameTimes(void);
 	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
 	void drawRows(const struct RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow);
-	void drawRotated(MiniIOSurface * s);
+	void drawTurned(MiniIOSurface * s, int32_t sx, int32_t sy, int32_t dx, int32_t dy, int32_t dw, int32_t dh);
+	uint32_t fTurnSaid = 0;         /* the fbrotate rectangle lines, told twice */
 	static void helperMain(void * self, wait_result_t result);
 	/* the scaling shared out (fb_threads): fThreads drawers, the presenter and fThreads - 1 helpers */
 	unsigned        fThreads;
@@ -867,38 +868,59 @@ IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
  */
 void
 /*
- * The rotation itself. It reads one column of the picture while writing one row of the panel:
- * straight through, that is a cache miss per pixel. In blocks of ROT_TILE both sides of a block
- * stay within reach of the caches, and the frame costs milliseconds -- the same order as the
- * scaled copy the swap already pays (some 9 ms), with the same one write per pixel.
+ * The turn itself, for one un-scaled rectangle of the canvas at (dx,dy), taken from the
+ * surface at (sx,sy). The panel rectangle of a rotated canvas rectangle is that rectangle
+ * TURNED -- computed here by hand, because the old path's scaling mapping would have made a
+ * portrait box of it. It reads one column of the picture while writing one row of the panel:
+ * straight through, a cache miss per pixel; in blocks of ROT_TILE both sides of a block stay
+ * within reach of the caches, and the frame costs milliseconds.
  */
 #define ROT_TILE 32
 
 void
-IOMobileFramebuffer::drawRotated(MiniIOSurface * s)
+IOMobileFramebuffer::drawTurned(MiniIOSurface * s, int32_t sx, int32_t sy, int32_t dx, int32_t dy, int32_t dw, int32_t dh)
 {
 	const uint32_t *pixels = (const uint32_t *) s->pixels();
 	const uint32_t stride = s->info.bytesPerRow / 4;
-	const uint32_t cw = fWidth, ch = fHeight;          /* the canvas: ch rows of cw */
+	const uint32_t cw = fWidth, ch = fHeight;          /* the canvas: ch rows of cw, landscape */
 	const bool turn90 = gFBRotate == 90;
 
-	for (uint32_t by = 0; by < fPanelHeight; by += ROT_TILE) {
-		for (uint32_t bx = 0; bx < fPanelWidth; bx += ROT_TILE) {
-			const uint32_t ey = by + ROT_TILE < fPanelHeight ? by + ROT_TILE : fPanelHeight;
-			const uint32_t ex = bx + ROT_TILE < fPanelWidth ? bx + ROT_TILE : fPanelWidth;
+	/* the panel rectangle the asked-for canvas rectangle lands on */
+	int64_t qx0, qx1, qy0, qy1;
 
-			for (uint32_t y = by; y < ey; y++) {
+	if (turn90) {
+		/* canvas (U,V) stands at panel (x = ch-1-V, y = U): the top edge along the panel's left */
+		qx0 = (int64_t) ch - (dy + dh);
+		qx1 = (int64_t) ch - dy;
+		qy0 = dx;
+		qy1 = (int64_t) dx + dw;
+	} else {
+		/* canvas (U,V) stands at panel (x = V, y = cw-1-U): the top edge along its right */
+		qx0 = dy;
+		qx1 = (int64_t) dy + dh;
+		qy0 = (int64_t) cw - (dx + dw);
+		qy1 = (int64_t) cw - dx;
+	}
+	if (qx0 < 0) { qx0 = 0; }
+	if (qy0 < 0) { qy0 = 0; }
+	if (qx1 > (int64_t) fPanelWidth)  { qx1 = fPanelWidth; }
+	if (qy1 > (int64_t) fPanelHeight) { qy1 = fPanelHeight; }
+
+	for (int64_t by = qy0; by < qy1; by += ROT_TILE) {
+		for (int64_t bx = qx0; bx < qx1; bx += ROT_TILE) {
+			const int64_t ey = by + ROT_TILE < qy1 ? by + ROT_TILE : qy1;
+			const int64_t ex = bx + ROT_TILE < qx1 ? bx + ROT_TILE : qx1;
+
+			for (int64_t y = by; y < ey; y++) {
 				uint32_t *to = (uint32_t *) (fBase + (size_t) y * fRowBytes);
 
 				if (turn90) {
-					/* the top of the picture stands along the panel's LEFT short edge */
-					for (uint32_t x = bx; x < ex; x++) {
-						to[x] = pixels[(size_t) (ch - 1 - x) * stride + y];
+					for (int64_t x = bx; x < ex; x++) {
+						to[x] = pixels[(size_t) (sy + (int64_t) ch - 1 - x - dy) * stride + (size_t) ((int64_t) sx + y - dx)];
 					}
 				} else {
-					/* ... and along its RIGHT one */
-					for (uint32_t x = bx; x < ex; x++) {
-						to[x] = pixels[(size_t) x * stride + (cw - 1 - y)];
+					for (int64_t x = bx; x < ex; x++) {
+						to[x] = pixels[(size_t) (sy + x - dy) * stride + (size_t) ((int64_t) sx + (int64_t) cw - 1 - y - dx)];
 					}
 				}
 			}
@@ -932,15 +954,23 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 		return;
 	}
 	/*
-	 * fbrotate: the ordinary full-frame swap -- one layer, the whole canvas, painted where the
-	 * canvas is -- goes through the rotation. Nothing else does: a rotated PART would need its
-	 * panel rectangle turned around too, and the desktop only ever sends the whole frame.
+	 * fbrotate: the picture is drawn the long way round and this copy is the turn. Any
+	 * un-scaled rectangle of the canvas turns: its panel rectangle is the same rectangle
+	 * ROTATED, not the scaled one the old path would work out -- which is what a half-fix
+	 * of only the full frame was (the window server is not obliged to send one).
 	 */
+	if (gFBRotate == 90 || gFBRotate == 270) {
+		if (fTurnSaid < 3) {
+			IOLog("MiniIOMobileFramebuffer: fbrotate=%u: surface %ux%u (%u B/row, %u planes), src %d %d %d %d, dst %d %d %d %d, turned=%s\n",
+			    gFBRotate, (uint32_t) s->info.width, (uint32_t) s->info.height, s->info.bytesPerRow,
+			    (uint32_t) s->info.planeCount, sx, sy, sw, sh, dx, dy, dw, dh,
+			    (fWidth == fPanelHeight && fHeight == fPanelWidth && dw == sw && dh == sh) ? "yes" : "no");
+			fTurnSaid++;
+		}
+	}
 	if ((gFBRotate == 90 || gFBRotate == 270) && fWidth == fPanelHeight && fHeight == fPanelWidth &&
-	    (uint32_t) sw == s->info.width && (uint32_t) sh == s->info.height &&
-	    (int32_t) s->info.width == (int32_t) fWidth && (int32_t) s->info.height == (int32_t) fHeight &&
-	    dx == 0 && dy == 0 && dw == (int32_t) fWidth && dh == (int32_t) fHeight) {
-		drawRotated(s);
+	    dw == sw && dh == sh) {
+		drawTurned(s, sx, sy, dx, dy, dw, dh);
 
 		return;
 	}
