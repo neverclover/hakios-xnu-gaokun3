@@ -97,9 +97,14 @@ def main():
                                     'platform-name', 'time-stamp', 'secure-root-prefix'))
     emit('identity_product', children['product'][0], ('name', 'AAPL,phandle'))
     product = {name_of(c): c for c in children['product'][1]}
-    emit('identity_haptics', product['haptics'][0], ('name', 'AAPL,phandle'))
-    # (the camera's: the loader takes from it what the hardware here has, the flash so far)
-    emit('identity_camera', product['camera'][0], ('name', 'AAPL,phandle'))
+    # Haptics and camera nodes: an iPhone's product tree always has them; a Wi-Fi iPad's tree
+    # may not (no Taptic Engine to describe). They are the same optional nodes the placeholder
+    # path already emits as the harmless empty table, so an absent one no longer raises.
+    for node, label in (('haptics', 'identity_haptics'), ('camera', 'identity_camera')):
+        if node in product:
+            emit(label, product[node][0], ('name', 'AAPL,phandle'))
+        else:
+            emit_empty(label)
 
 
 if __name__ == '__main__':
