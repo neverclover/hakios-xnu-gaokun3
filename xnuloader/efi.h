@@ -83,7 +83,9 @@ typedef struct {
 	efi_status (EFIAPI *get_time)(struct efi_time *time, void *capabilities);
 	void *set_time, *get_wakeup_time, *set_wakeup_time;
 	void *set_virtual_address_map, *convert_pointer;
-	void *get_variable, *get_next_variable_name, *set_variable;
+	efi_status (EFIAPI *get_variable)(const char16 *name, const efi_guid *vendor, uint32_t *attributes, uint64_t *data_size, void *data);
+	void *get_next_variable_name;
+	efi_status (EFIAPI *set_variable)(const char16 *name, const efi_guid *vendor, uint32_t attributes, uint64_t data_size, const void *data);
 	void *get_next_high_mono_count;
 	void (EFIAPI *reset_system)(int type, efi_status status, uint64_t size, void *data);
 } efi_runtime_services;

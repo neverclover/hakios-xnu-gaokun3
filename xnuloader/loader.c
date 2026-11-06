@@ -4311,6 +4311,46 @@ ramfb_phone_screen(void)
  * Only the kernel and a root image that fits in the payload come this way; the big Darwin system image does not
  * (docs/uefi-boot.md says what does).
  */
+/*
+ * A counter in the firmware's own variables (it survives resets, which is the whole point): how many
+ * boots in a row the loader has started the experimental payload-next.bin. The run counts as failed
+ * until the kernel comes back or resets on its own, so it is raised before the jump: a kernel that
+ * hangs with its watchdog biting does the raising by not coming back. Two in a row and the loader
+ * stops starting the experiment: the machine always ends at a usable system.
+ */
+static const efi_guid nextfail_guid = { 0x4c4b696e, 0x6169, 0x4e66, { 'a', 'i', 'l', 'c', 't', 'r', 'y', 0 } };
+
+static uint64_t
+next_fail_count(void)
+{
+	static const char16 name[] = u"HakiNextFail";
+	uint64_t value = 0, size = sizeof(value);
+	uint32_t attributes;
+
+	if (EFI_ERROR(ST->rt->get_variable(name, &nextfail_guid, &attributes, &size, &value)) || size != sizeof(value)) {
+		return 0;
+	}
+	return value;
+}
+
+static void
+next_fail_raise(void)
+{
+	static const char16 name[] = u"HakiNextFail";
+	uint64_t value = next_fail_count() + 1;
+
+	ST->rt->set_variable(name, &nextfail_guid, 0x00000007 /* NV|BS|RT */, sizeof(value), &value);
+}
+
+static void
+next_fail_clear(void)
+{
+	static const char16 name[] = u"HakiNextFail";
+	uint64_t zero = 0;
+
+	ST->rt->set_variable(name, &nextfail_guid, 0x00000007 /* NV|BS|RT */, sizeof(zero), &zero);
+}
+
 static uint64_t volume_payload_bytes;           /* 0: nothing was read; else the payload's size */
 static int payload_chosen_next;           /* which of the two the loader picked */
 static const char *volume_payload_note;         /* why not, if it was looked for */
@@ -4339,10 +4379,18 @@ load_payload_from_volume(int want_next)   /* want_next: prefer the experimental 
 		volume_payload_note = "the volume cannot be opened";
 		return 0;
 	}
+	if (want_next && next_fail_count() >= 2) {
+		print("the newer payload did not come back on two boots in a row: not trying it this boot\n");
+		want_next = 0;
+	}
 	if (want_next && !EFI_ERROR(root->open(root, &file, next_path, EFI_FILE_MODE_READ, 0)) && file != NULL) {
 		payload_chosen_next = 1;
 	} else {
 		file = NULL;
+		if (payload_chosen_next == 0 && next_fail_count() != 0) {
+			/* the experiment is off the volume: forget the failures it left behind */
+			next_fail_clear();
+		}
 		if (EFI_ERROR(root->open(root, &file, path, EFI_FILE_MODE_READ, 0)) || file == NULL) {
 			volume_payload_note = "there is no payload (nor payload-next) on the volume";
 			root->close(root);
@@ -4622,6 +4670,9 @@ efi_main(efi_handle image, efi_system_table *st)
 
 	/* One-shot mode: run the kernel that came with the image, then reset. */
 	if (have_payload) {
+		if (payload_chosen_next) {
+			next_fail_raise();
+		}
 		run_kernel(0, 0);
 		/*
 		 * When what came back was the experimental newer payload, do not stand by and reset into it
